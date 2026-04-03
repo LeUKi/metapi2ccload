@@ -211,26 +211,41 @@ interface ModelResolution {
   logicalRouteIds: number[];
   concreteRouteIds: number[];
   suppressedStandaloneRouteIds: number[];
+  bindings: ResolvedBinding[];
 }
 
-interface Channel通道组 {
-  groupKey: string;
+interface ResolvedBinding {
+  requestedModel: string;
+  logicalRouteId: number;
+  logicalModel: string;
+  concreteRouteId: number;
+  concreteModel: string;
+}
+
+interface ResolvedChannelEntry {
+  entryKey: string;
   site: Site;
   account: Account;
   token: AccountToken | null;
   apiKey: string;
-  keySource: 'token' | 'apiToken' | 'accessToken' | 'missing';
-  models: Set<string>;
-  routeIds: Set<number>;
-  routeModes: Set<string>;
-  routingStrategies: Set<string>;
+  keySource: ApiKeySource;
+  requestedModel: string;
+  logicalRouteId: number;
+  logicalModel: string;
+  concreteRouteId: number;
+  concreteModel: string;
+  routeChannelId: number;
+  rawSourceModel: string;
+  canonicalModel: string;
+  aliasModels: Set<string>;
   modelMappings: string[];
-  priorities: number[];
-  weights: number[];
-  routeChannelIds: number[];
-  allRouteChannelsEnabled: boolean;
+  priority: number;
+  weight: number;
+  routeChannelEnabled: boolean;
   hasSuspiciousPlatform: boolean;
 }
+
+type ApiKeySource = 'token' | 'apiToken' | 'accessToken' | 'missing';
 
 interface CcloadRowDraft {
   name: string;
@@ -250,7 +265,7 @@ interface CcloadRow extends CcloadRowDraft {
 
 interface ProfileConversionResult {
   profile: ConversionProfile;
-  groups: ChannelGroup[];
+  entries: ResolvedChannelEntry[];
   resolutions: ModelResolution[];
   warnings: string[];
   rowDrafts: CcloadRowDraft[];
@@ -702,33 +717,41 @@ function convertProfile(params: {
     }),
   );
 
-  const groupByKey = new Map<string, ChannelGroup>();
+  const entryByKey = new Map<string, ResolvedChannelEntry>();
 
   // 单个 profile 的转换策略：
-  // 1. 把 profile 请求的模型解析为 concrete route ID。
-  // 2. 读取这些 route 挂载的全部 routeChannels。
-  // 3. 按 site/account/token 折叠成逻辑通道组。
-  // 4. 再根据 profile 的 merge/split 模式
-  //    和 channel_type 列表，把每个通道组扇出成最终记录。
+  // 1. 把 profile 请求的模型解析为“逻辑路由 -> 真实路由”的绑定关系。
+  // 2. 读取真实路由挂载的全部 routeChannels。
+  // 3. 按 source entry（site/account/token/concrete route/source model）落成导出实体。
+  // 4. 再根据 profile 的 merge/split 模式和 channel_type 列表生成最终记录。
   for (const resolution of resolutions) {
     if (resolution.concreteRouteIds.length === 0) {
       warnings.push(`模型 ${resolution.model} 没有匹配到任何可落地的 concrete route。`);
       continue;
     }
 
-    for (const routeId of resolution.concreteRouteIds) {
-      const route = indexed.routeById.get(routeId);
-      if (!route) {
-        warnings.push(`已解析的 route ${routeId} 对于模型 ${resolution.model} 不存在。`);
+    for (const binding of resolution.bindings) {
+      const concreteRoute = indexed.routeById.get(binding.concreteRouteId);
+      if (!concreteRoute) {
+        warnings.push(
+          `已解析的真实路由 ${binding.concreteRouteId} 对于模型 ${resolution.model} 不存在。`,
+        );
         continue;
       }
 
-      const routeChannels = indexed.routeChannelsByRouteId.get(routeId) ?? [];
+      const routeChannels = indexed.routeChannelsByRouteId.get(binding.concreteRouteId) ?? [];
       if (routeChannels.length === 0) {
         warnings.push(
-          `Concrete route ${routeId} (${route.modelPattern}) 没有 routeChannels，因此无法生成 ccload 行。`,
+          `真实路由 ${binding.concreteRouteId} (${concreteRoute.modelPattern}) 没有 routeChannels，因此无法生成 ccload 行。`,
         );
       }
+
+      const canonicalModel = pickCanonicalModel({
+        logicalModel: binding.logicalModel,
+        rawSourceModels: routeChannels.map(
+          (routeChannel) => routeChannel.sourceModel?.trim() || concreteRoute.modelPattern,
+        ),
+      });
 
       for (const routeChannel of routeChannels) {
         const account = indexed.accountById.get(routeChannel.accountId);
@@ -745,54 +768,71 @@ function convertProfile(params: {
 
         const token = routeChannel.tokenId === null ? null : indexed.tokenById.get(routeChannel.tokenId) ?? null;
         const apiKey = chooseApiKey(account, token);
-        const groupKey = buildGroupKey(site, account, token);
-        const group = groupByKey.get(groupKey) ?? createEmptyGroup({ site, account, token, apiKey });
+        const rawSourceModel = routeChannel.sourceModel?.trim() || concreteRoute.modelPattern;
+        const entryKey = buildEntryKey({
+          site,
+          account,
+          token,
+          concreteRouteId: binding.concreteRouteId,
+          rawSourceModel,
+        });
+        const entry =
+          entryByKey.get(entryKey) ??
+          createEmptyEntry({
+            site,
+            account,
+            token,
+            apiKey,
+            binding,
+            routeChannel,
+            rawSourceModel,
+            canonicalModel,
+          });
 
-        group.models.add(resolution.model);
-        group.routeIds.add(route.id);
-        group.routeModes.add(route.routeMode);
-        group.routingStrategies.add(route.routingStrategy);
-        group.priorities.push(routeChannel.priority);
-        group.weights.push(routeChannel.weight);
-        group.routeChannelIds.push(routeChannel.id);
-        group.allRouteChannelsEnabled = group.allRouteChannelsEnabled && routeChannel.enabled;
-        group.hasSuspiciousPlatform = group.hasSuspiciousPlatform || SUSPICIOUS_PLATFORMS.has(site.platform);
+        entry.aliasModels.add(resolution.model);
+        entry.aliasModels.add(binding.logicalModel);
+        entry.aliasModels.add(binding.concreteModel);
+        entry.aliasModels.add(rawSourceModel);
+        entry.priority = Math.min(entry.priority, routeChannel.priority);
+        entry.weight = Math.max(entry.weight, routeChannel.weight);
+        entry.routeChannelEnabled = entry.routeChannelEnabled && routeChannel.enabled;
+        entry.hasSuspiciousPlatform = entry.hasSuspiciousPlatform || SUSPICIOUS_PLATFORMS.has(site.platform);
 
-        if (route.modelMapping) {
-          group.modelMappings.push(route.modelMapping);
+        if (concreteRoute.modelMapping) {
+          entry.modelMappings.push(concreteRoute.modelMapping);
         }
 
-        groupByKey.set(groupKey, group);
+        entryByKey.set(entryKey, entry);
       }
     }
   }
 
-  const groups = Array.from(groupByKey.values()).sort(compareGroups);
-  for (const group of groups) {
-    if (group.keySource === 'missing') {
-      warnings.push(`通道组 ${group.groupKey} 没有可用的 token/api key。`);
-    } else if (group.keySource === 'accessToken') {
+  const entries = Array.from(entryByKey.values()).sort(compareEntries);
+  for (const entry of entries) {
+    if (entry.keySource === 'missing') {
+      warnings.push(`source entry ${entry.entryKey} 没有可用的 token/api key。`);
+    } else if (entry.keySource === 'accessToken') {
       warnings.push(
-        `通道组 ${group.groupKey} 回退使用了 accessToken。请确认该密钥可作为 ccload api_key 使用。`,
+        `source entry ${entry.entryKey} 回退使用了 accessToken。请确认该密钥可作为 ccload api_key 使用。`,
       );
     }
 
-    if (group.hasSuspiciousPlatform) {
+    if (entry.hasSuspiciousPlatform) {
       warnings.push(
-        `通道组 ${group.groupKey} 使用的平台是 ${group.site.platform}。把它转换成 ccload 渠道类型属于激进策略，建议手动核实。`,
+        `source entry ${entry.entryKey} 使用的平台是 ${entry.site.platform}。把它转换成 ccload 渠道类型属于激进策略，建议手动核实。`,
       );
     }
   }
 
   const rowDrafts = buildRowDrafts({
-    groups,
+    entries,
     profile,
     appendProfileNameToName,
   });
 
   return {
     profile,
-    groups,
+    entries,
     resolutions,
     warnings: Array.from(new Set(warnings)).sort(),
     rowDrafts,
@@ -845,6 +885,21 @@ function resolveRoutesForModel(params: {
     ),
   ).sort((left, right) => left - right);
 
+  const bindings = logicalRouteIds.flatMap((logicalRouteId) => {
+    const logicalRoute = indexed.routeById.get(logicalRouteId);
+    if (!logicalRoute) {
+      return [];
+    }
+
+    return expandToConcreteBindings({
+      requestedModel: model,
+      logicalRoute,
+      routeId: logicalRouteId,
+      indexed,
+      visited: new Set<number>(),
+    });
+  });
+
   return {
     model,
     logicalRouteIds: logicalRouteIds.sort((left, right) => left - right),
@@ -852,7 +907,53 @@ function resolveRoutesForModel(params: {
     suppressedStandaloneRouteIds: Array.from(suppressedStandaloneRouteIds).sort(
       (left, right) => left - right,
     ),
+    bindings,
   };
+}
+
+function expandToConcreteBindings(params: {
+  requestedModel: string;
+  logicalRoute: TokenRoute;
+  routeId: number;
+  indexed: IndexedMetapi;
+  visited: Set<number>;
+}): ResolvedBinding[] {
+  const { requestedModel, logicalRoute, routeId, indexed, visited } = params;
+  const route = indexed.routeById.get(routeId);
+  if (!route) {
+    return [];
+  }
+
+  if (visited.has(routeId)) {
+    throw new Error(`在展开 route group binding 时检测到循环，route 为 ${routeId}.`);
+  }
+
+  if (route.routeMode !== 'explicit_group') {
+    return [
+      {
+        requestedModel,
+        logicalRouteId: logicalRoute.id,
+        logicalModel: logicalRoute.modelPattern,
+        concreteRouteId: route.id,
+        concreteModel: route.modelPattern,
+      },
+    ];
+  }
+
+  visited.add(routeId);
+
+  const bindings = (indexed.groupSourceRouteIdsByGroupRouteId.get(routeId) ?? []).flatMap((sourceRouteId) =>
+    expandToConcreteBindings({
+      requestedModel,
+      logicalRoute,
+      routeId: sourceRouteId,
+      indexed,
+      visited,
+    }),
+  );
+
+  visited.delete(routeId);
+  return bindings;
 }
 
 function expandToConcreteRouteIds(params: {
@@ -894,7 +995,7 @@ function expandToConcreteRouteIds(params: {
 function chooseApiKey(
   account: Account,
   token: AccountToken | null,
-): { value: string; source: ChannelGroup['keySource'] } {
+): { value: string; source: ApiKeySource } {
   if (token?.token) {
     return { value: token.token, source: 'token' };
   }
@@ -912,101 +1013,150 @@ function chooseApiKey(
   return { value: '', source: 'missing' };
 }
 
-function buildGroupKey(site: Site, account: Account, token: AccountToken | null): string {
-  const tokenPart = token ? `token:${token.id}` : 'token:fallback-account-secret';
-  return `${site.url} | account:${account.id} | ${tokenPart}`;
-}
-
-function createEmptyGroup(params: {
+function buildEntryKey(params: {
   site: Site;
   account: Account;
   token: AccountToken | null;
-  apiKey: { value: string; source: ChannelGroup['keySource'] };
-}): Channel通道组 {
+  concreteRouteId: number;
+  rawSourceModel: string;
+}): string {
+  const { site, account, token, concreteRouteId, rawSourceModel } = params;
+  const tokenPart = token ? `token:${token.id}` : 'token:fallback-account-secret';
+  return `${site.url} | account:${account.id} | ${tokenPart} | route:${concreteRouteId} | source:${rawSourceModel}`;
+}
+
+function createEmptyEntry(params: {
+  site: Site;
+  account: Account;
+  token: AccountToken | null;
+  apiKey: { value: string; source: ApiKeySource };
+  binding: ResolvedBinding;
+  routeChannel: RouteChannel;
+  rawSourceModel: string;
+  canonicalModel: string;
+}): ResolvedChannelEntry {
   return {
-    groupKey: buildGroupKey(params.site, params.account, params.token),
+    entryKey: buildEntryKey({
+      site: params.site,
+      account: params.account,
+      token: params.token,
+      concreteRouteId: params.binding.concreteRouteId,
+      rawSourceModel: params.rawSourceModel,
+    }),
     site: params.site,
     account: params.account,
     token: params.token,
     apiKey: params.apiKey.value,
     keySource: params.apiKey.source,
-    models: new Set<string>(),
-    routeIds: new Set<number>(),
-    routeModes: new Set<string>(),
-    routingStrategies: new Set<string>(),
+    requestedModel: params.binding.requestedModel,
+    logicalRouteId: params.binding.logicalRouteId,
+    logicalModel: params.binding.logicalModel,
+    concreteRouteId: params.binding.concreteRouteId,
+    concreteModel: params.binding.concreteModel,
+    routeChannelId: params.routeChannel.id,
+    rawSourceModel: params.rawSourceModel,
+    canonicalModel: params.canonicalModel,
+    aliasModels: new Set<string>([
+      params.binding.requestedModel,
+      params.binding.logicalModel,
+      params.binding.concreteModel,
+      params.rawSourceModel,
+    ]),
     modelMappings: [],
-    priorities: [],
-    weights: [],
-    routeChannelIds: [],
-    allRouteChannelsEnabled: true,
+    priority: params.routeChannel.priority,
+    weight: params.routeChannel.weight,
+    routeChannelEnabled: params.routeChannel.enabled,
     hasSuspiciousPlatform: SUSPICIOUS_PLATFORMS.has(params.site.platform),
   };
 }
 
-function compareGroups(left: ChannelGroup, right: ChannelGroup): number {
+function compareEntries(left: ResolvedChannelEntry, right: ResolvedChannelEntry): number {
   return (
     left.site.url.localeCompare(right.site.url) ||
     left.account.id - right.account.id ||
-    (left.token?.id ?? -1) - (right.token?.id ?? -1)
+    (left.token?.id ?? -1) - (right.token?.id ?? -1) ||
+    left.concreteRouteId - right.concreteRouteId ||
+    left.rawSourceModel.localeCompare(right.rawSourceModel)
   );
 }
 
 function buildRowDrafts(params: {
-  groups: ChannelGroup[];
+  entries: ResolvedChannelEntry[];
   profile: ConversionProfile;
   appendProfileNameToName: boolean;
 }): CcloadRowDraft[] {
-  const { groups, profile, appendProfileNameToName } = params;
+  const { entries, profile, appendProfileNameToName } = params;
   const rows: CcloadRowDraft[] = [];
 
-  for (const group of groups) {
-    // profile 决定了命中的模型是保留为一条合并记录，
-    // 还是先拆成单模型记录，再进行 channel_type 扇出。
-    const modelLabels = buildModelLabels({
-      group,
-      profile,
-    });
-    const minimumPriority = group.priorities.length > 0 ? Math.min(...group.priorities) : 0;
-    const mergedModelRedirects = mergeModelRedirects(group.modelMappings);
-    const enabled = isGroupEnabled(group);
-
-    for (const modelLabel of modelLabels) {
+  if (profile.modelMode === 'split') {
+    for (const entry of entries) {
       for (const channelType of profile.channelTypes) {
         rows.push({
           name: buildChannelName({
-            group,
-            modelLabel,
+            entry,
+            modelLabel: entry.canonicalModel,
             channelType,
             profileName: profile.name,
             appendProfileNameToName,
           }),
-          api_key: group.apiKey,
-          url: group.site.url,
-          priority: String(minimumPriority),
-          models: modelLabel,
-          model_redirects: JSON.stringify(mergedModelRedirects),
+          api_key: entry.apiKey,
+          url: entry.site.url,
+          priority: String(entry.priority),
+          models: entry.canonicalModel,
+          model_redirects: JSON.stringify(buildMergedRedirects(entry)),
           channel_type: channelType,
           key_strategy: 'sequential',
-          enabled: String(enabled),
+          enabled: String(isEntryEnabled(entry)),
         });
       }
+    }
+
+    return rows;
+  }
+
+  const mergedEntries = mergeEntriesForProfile(entries);
+  for (const entry of mergedEntries) {
+    const modelLabel = Array.from(entry.canonicalModels).join(',');
+    for (const channelType of profile.channelTypes) {
+      rows.push({
+        name: buildChannelName({
+          entry,
+          modelLabel,
+          channelType,
+          profileName: profile.name,
+          appendProfileNameToName,
+        }),
+        api_key: entry.apiKey,
+        url: entry.site.url,
+        priority: String(entry.priority),
+        models: modelLabel,
+        model_redirects: JSON.stringify(buildMergedRedirects(entry)),
+        channel_type: channelType,
+        key_strategy: 'sequential',
+        enabled: String(isMergedEntryEnabled(entry)),
+      });
     }
   }
 
   return rows;
 }
 
-function buildModelLabels(params: {
-  group: ChannelGroup;
-  profile: ConversionProfile;
-}): string[] {
-  const orderedModels = params.profile.models.filter((model) => params.group.models.has(model));
-
-  if (params.profile.modelMode === 'split') {
-    return orderedModels;
+function pickCanonicalModel(params: { logicalModel: string; rawSourceModels: string[] }): string {
+  const uniqueModels = Array.from(new Set(params.rawSourceModels.filter(Boolean)));
+  if (uniqueModels.length === 0) {
+    return params.logicalModel;
   }
 
-  return orderedModels.length > 0 ? [orderedModels.join(',')] : [];
+  const sourceModelsWithoutVendorPrefix = uniqueModels.filter((model) => !model.includes(':'));
+  if (sourceModelsWithoutVendorPrefix.length === 1) {
+    return sourceModelsWithoutVendorPrefix[0];
+  }
+
+  if (sourceModelsWithoutVendorPrefix.length > 1) {
+    return params.logicalModel;
+  }
+
+  return params.logicalModel;
 }
 
 function mergeModelRedirects(modelMappings: string[]): Record<string, string> {
@@ -1031,41 +1181,37 @@ function mergeModelRedirects(modelMappings: string[]): Record<string, string> {
   return merged;
 }
 
-function isGroupEnabled(group: ChannelGroup): boolean {
-  // enabled 规则故意设置得比较严格，避免导出 metapi 已经判定有问题的
-  // ccload 渠道。
-  const accountActive = group.account.status === 'active';
-  const siteActive = group.site.status === 'active';
-  const tokenEnabled = group.token ? group.token.enabled : true;
+function buildAliasRedirects(entry: { canonicalModel: string; aliasModels: Set<string> }): Record<string, string> {
+  const redirects: Record<string, string> = {};
+  for (const aliasModel of entry.aliasModels) {
+    if (aliasModel && aliasModel !== entry.canonicalModel) {
+      redirects[aliasModel] = entry.canonicalModel;
+    }
+  }
 
-  return (
-    group.allRouteChannelsEnabled &&
-    accountActive &&
-    siteActive &&
-    tokenEnabled &&
-    group.apiKey.length > 0
-  );
+  return redirects;
 }
 
 function buildChannelName(params: {
-  group: ChannelGroup;
+  entry: ResolvedChannelEntry | MergedChannelEntry;
   modelLabel: string;
   channelType: string;
   profileName: string;
   appendProfileNameToName: boolean;
 }): string {
-  const { group, modelLabel, channelType, profileName, appendProfileNameToName } = params;
+  const { entry, modelLabel, channelType, profileName, appendProfileNameToName } = params;
 
   // 用户要求的名称格式：
-  //   site.url|label|acct-<id>|account-secret|models|channel_type
+  //   site.url|label|acct-<id>|account-secret|models|src-<source>|channel_type
   // 可选尾段：
   //   |profile-name
   const parts = [
-    group.site.url,
-    buildDisplayLabel(group),
-    `acct-${group.account.id}`,
+    entry.site.url,
+    buildDisplayLabel(entry),
+    `acct-${entry.account.id}`,
     'account-secret',
     modelLabel,
+    `src-${slugifySourceModel(entry.rawSourceModel)}`,
     channelType,
   ];
 
@@ -1076,23 +1222,126 @@ function buildChannelName(params: {
   return parts.join('|');
 }
 
-function buildDisplayLabel(group: ChannelGroup): string {
+function buildDisplayLabel(entry: { token: AccountToken | null; account: Account; site: Site }): string {
   // 第二段既要稳定，也要尽量可读。token 名通常是最合适的显示标签，
   // 因为它往往已经携带了用户自己的业务语义，
   // 比如 `metapi`、`default`、`user group (auto)`。
-  if (group.token?.name?.trim()) {
-    return group.token.name.trim();
+  if (entry.token?.name?.trim()) {
+    return entry.token.name.trim();
   }
 
-  if (group.account.username?.trim()) {
-    return group.account.username.trim();
+  if (entry.account.username?.trim()) {
+    return entry.account.username.trim();
   }
 
-  if (group.site.name?.trim() && group.site.name.trim() !== group.site.url) {
-    return group.site.name.trim();
+  if (entry.site.name?.trim() && entry.site.name.trim() !== entry.site.url) {
+    return entry.site.name.trim();
   }
 
   return 'account';
+}
+
+interface MergedChannelEntry {
+  mergeKey: string;
+  site: Site;
+  account: Account;
+  token: AccountToken | null;
+  apiKey: string;
+  keySource: ApiKeySource;
+  rawSourceModel: string;
+  canonicalModels: Set<string>;
+  aliasModels: Set<string>;
+  modelMappings: string[];
+  priority: number;
+  routeChannelEnabled: boolean;
+  hasSuspiciousPlatform: boolean;
+}
+
+function mergeEntriesForProfile(entries: ResolvedChannelEntry[]): MergedChannelEntry[] {
+  const mergedByKey = new Map<string, MergedChannelEntry>();
+
+  for (const entry of entries) {
+    // merge 模式只允许在同一个真实 source entry 内合并多个 canonical model，
+    // 不能跨 rawSourceModel 或 concrete route 回收成一条行。
+    const mergeKey = [
+      entry.site.url,
+      entry.account.id,
+      entry.token?.id ?? 'fallback-account-secret',
+      entry.rawSourceModel,
+      entry.apiKey,
+    ].join('|');
+
+    const existing = mergedByKey.get(mergeKey);
+    if (existing) {
+      existing.canonicalModels.add(entry.canonicalModel);
+      for (const aliasModel of entry.aliasModels) {
+        existing.aliasModels.add(aliasModel);
+      }
+      existing.modelMappings.push(...entry.modelMappings);
+      existing.priority = Math.min(existing.priority, entry.priority);
+      existing.routeChannelEnabled = existing.routeChannelEnabled && entry.routeChannelEnabled;
+      existing.hasSuspiciousPlatform = existing.hasSuspiciousPlatform || entry.hasSuspiciousPlatform;
+      continue;
+    }
+
+    mergedByKey.set(mergeKey, {
+      mergeKey,
+      site: entry.site,
+      account: entry.account,
+      token: entry.token,
+      apiKey: entry.apiKey,
+      keySource: entry.keySource,
+      rawSourceModel: entry.rawSourceModel,
+      canonicalModels: new Set<string>([entry.canonicalModel]),
+      aliasModels: new Set<string>(entry.aliasModels),
+      modelMappings: [...entry.modelMappings],
+      priority: entry.priority,
+      routeChannelEnabled: entry.routeChannelEnabled,
+      hasSuspiciousPlatform: entry.hasSuspiciousPlatform,
+    });
+  }
+
+  return Array.from(mergedByKey.values()).sort((left, right) => left.mergeKey.localeCompare(right.mergeKey));
+}
+
+function buildMergedRedirects(entry: ResolvedChannelEntry | MergedChannelEntry): Record<string, string> {
+  if ('canonicalModels' in entry) {
+    const redirects = mergeModelRedirects(entry.modelMappings);
+    if (entry.canonicalModels.size === 1) {
+      // 只有单一 canonical model 时，alias -> canonical 的重定向才有明确指向。
+      const canonicalModel = Array.from(entry.canonicalModels)[0];
+      Object.assign(redirects, buildAliasRedirects({ canonicalModel, aliasModels: entry.aliasModels }));
+    }
+    return redirects;
+  }
+
+  return {
+    ...mergeModelRedirects(entry.modelMappings),
+    ...buildAliasRedirects(entry),
+  };
+}
+
+function isEntryEnabled(entry: ResolvedChannelEntry): boolean {
+  // enabled 规则保持保守：任一关键对象失效，就不把这条 source entry 标为启用。
+  const accountActive = entry.account.status === 'active';
+  const siteActive = entry.site.status === 'active';
+  const tokenEnabled = entry.token ? entry.token.enabled : true;
+
+  return entry.routeChannelEnabled && accountActive && siteActive && tokenEnabled && entry.apiKey.length > 0;
+}
+
+function isMergedEntryEnabled(entry: MergedChannelEntry): boolean {
+  const accountActive = entry.account.status === 'active';
+  const siteActive = entry.site.status === 'active';
+  const tokenEnabled = entry.token ? entry.token.enabled : true;
+
+  return entry.routeChannelEnabled && accountActive && siteActive && tokenEnabled && entry.apiKey.length > 0;
+}
+
+function slugifySourceModel(value: string): string {
+  // source 后缀只用于保证名称稳定可区分，不参与 canonical model 归一。
+  const normalized = value.trim().replaceAll(':', '-');
+  return slugify(normalized) || 'source';
 }
 
 function prepareOutputs(params: {
@@ -1200,20 +1449,20 @@ function printConversionSummary(params: {
   console.log(`- profile 数量：${config.profiles.length}`);
 
   for (const profileResult of profileResults) {
-    const enabledGroupCount = profileResult.groups.filter(isGroupEnabled).length;
-    const safePlatformGroupCount = profileResult.groups.filter((group) =>
-      SAFE_PLATFORMS.has(group.site.platform),
+    const enabledEntryCount = profileResult.entries.filter(isEntryEnabled).length;
+    const safePlatformEntryCount = profileResult.entries.filter((entry) =>
+      SAFE_PLATFORMS.has(entry.site.platform),
     ).length;
-    const platformCounts = countBy(profileResult.groups.map((group) => group.site.platform));
-    const keySourceCounts = countBy(profileResult.groups.map((group) => group.keySource));
+    const platformCounts = countBy(profileResult.entries.map((entry) => entry.site.platform));
+    const keySourceCounts = countBy(profileResult.entries.map((entry) => entry.keySource));
 
     console.log(`\nProfile：${profileResult.profile.name}`);
     console.log(`- 模型列表：${profileResult.profile.models.join(', ')}`);
     console.log(`- 模型模式：${profileResult.profile.modelMode}`);
     console.log(`- 渠道类型：${profileResult.profile.channelTypes.join(', ')}`);
-    console.log(`- 逻辑通道组数量：${profileResult.groups.length}`);
-    console.log(`- 启用中的通道组数量：${enabledGroupCount}`);
-    console.log(`- openai/new-api/sub2api 平台上的通道组数量：${safePlatformGroupCount}`);
+    console.log(`- source entry 数量：${profileResult.entries.length}`);
+    console.log(`- 启用中的 source entry 数量：${enabledEntryCount}`);
+    console.log(`- openai/new-api/sub2api 平台上的 source entry 数量：${safePlatformEntryCount}`);
     console.log(`- 输出级去重前的行数：${profileResult.rowDrafts.length}`);
     console.log(`- 平台分布：${formatCounts(platformCounts)}`);
     console.log(`- api key 来源分布：${formatCounts(keySourceCounts)}`);
@@ -1223,6 +1472,11 @@ function printConversionSummary(params: {
       console.log(
         `  - ${resolution.model}: logicalRoutes=[${resolution.logicalRouteIds.join(', ')}], concreteRoutes=[${resolution.concreteRouteIds.join(', ')}], suppressedStandalone=[${resolution.suppressedStandaloneRouteIds.join(', ')}]`,
       );
+      for (const binding of resolution.bindings) {
+        console.log(
+          `    - binding: requested=${binding.requestedModel}, logical=${binding.logicalModel}#${binding.logicalRouteId}, concrete=${binding.concreteModel}#${binding.concreteRouteId}`,
+        );
+      }
     }
 
     if (profileResult.warnings.length > 0) {
