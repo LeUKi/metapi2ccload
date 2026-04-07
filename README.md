@@ -1,402 +1,315 @@
 # metapi2ccload
 
-把 metapi 备份文件转换成 ccload 渠道 CSV 的工具。
+把 metapi 备份转换成 ccload CSV。
 
-这个仓库不是做“字段直拷”，而是把 metapi 的关系化配置：
+这个工具不是字段直拷，而是按 metapi 的路由语义导出 ccload 渠道。
 
-- `sites`
-- `accounts`
-- `accountTokens`
-- `tokenRoutes`
-- `routeChannels`
-- `routeGroupSources`
+---
 
-解析成 ccload 能直接消费的渠道列表，同时尽量保留 metapi 原本的路由语义。
+## 核心概念
 
-项目主脚本：
+### logical model
 
-- `scripts/metapi-to-ccload.ts`
+metapi 里的逻辑入口模型名。
 
-## 这次重构解决了什么
+例如：
 
-这次导出逻辑重点修复了两个核心问题：
+- `deepseek-v3.2`
+- `glm-5`
+- `claude-opus-4.6`
 
-- `GLM-5` 和 `glm-5` 不会再因为同站点、同账号、同 token 被错误并到同一条导出行
-- `explicit_group` 不会再被揉成一条混合记录，而是会按真实 source route 拆成多条 ccload row
+对于 `explicit_group`，这就是 group route 的 `modelPattern`。
 
-重构后的目标是让 ccload 的导出语义尽量贴近 metapi：
+### source entry
 
-- metapi 里的一个逻辑模型入口，可以对应多个真实上游来源
-- 导出到 ccload 后，仍然可以保留“一个请求模型名，多个真实通道分流”的能力
-- 不会因为大小写、命名接近、点横线差异就做粗暴归一化
+一个真实来源渠道。
 
-## 核心语义
-
-### 四层模型名
-
-导出流程里现在明确区分四层模型名：
-
-1. `requestedModel`
-   - profile 里要求导出的模型名
-
-2. `logicalModel`
-   - 逻辑路由的 `modelPattern`
-   - 对 `explicit_group` 来说，这是逻辑入口模型
-
-3. `rawSourceModel`
-   - 真实上游模型名
-   - 优先来自 `routeChannel.sourceModel`
-   - 如果没有，再回退到 concrete route 的 `modelPattern`
-
-4. `canonicalModel`
-   - 最终写进 ccload `models` 列的统一请求模型名
-   - 只会在明确属于同一个逻辑组时做保守归一
-
-### 新的导出粒度
-
-旧实现会先按下面这把 key 折叠：
-
-```text
-site + account + token-or-fallback-secret
-```
-
-这会导致不同 concrete route、不同真实 source model 被过早合并。
-
-现在真正的中间导出实体是 `source entry`，最少细化到：
+最少细化到：
 
 ```text
 site + account + token-or-fallback-secret + concrete-route + raw-source-model
 ```
 
-也就是说：
+一句话理解：
 
-- 同一个 token 下的不同真实上游，不再自动并到一条
-- 同一个逻辑模型展开出的多个 source route，会分别导出
-- merge/split 只影响同一个 source entry 的模型列写法，不再跨 source entry 合并
+**一个 source entry = 一条真实上游通道。**
 
-## explicit_group 的导出规则
+### canonical request model
 
-### 解析行为
+最终写进 ccload `models` 列的请求模型名。
 
-脚本会先精确匹配：
+一句话理解：
 
-```text
-route.modelPattern === requested model
-```
+**用户向 ccload 请求的模型名。**
 
-如果命中的是 `explicit_group`，则：
+---
 
-- 把 group route 视为逻辑路由
-- 递归展开到全部 concrete route
-- 为每个 concrete route 保留一条绑定关系
+## 三条关键规则
 
-绑定关系内部会记录：
+### 1. `explicit_group` 一定拆成多条真实渠道
 
-- `requestedModel`
-- `logicalRouteId`
-- `logicalModel`
-- `concreteRouteId`
-- `concreteModel`
+如果一个 logical model 展开到多个真实来源，导出后仍然是多条 row。
 
-这样导出阶段不会再丢失“逻辑入口 -> 真实来源”的关系。
+不会把多个真实来源压成一条 ccload 渠道。
 
-### 导出行为
+例如 `deepseek-v3.2` 如果展开到：
 
-对于一个 `explicit_group`：
+- source A → `DeepSeek-V3.2`
+- source A → `deepseek-ai/deepseek-v3.2`
+- source B → `deepseek-ai/deepseek-v3.2`
 
-- 会先展开到全部真实 source route
-- 每条 source route 对应一条 ccload row
-- 多条 row 可以共享同一个 `canonicalModel`
+那么导出后应该还是 **3 条 row**。
 
-这意味着最终效果是：
+### 2. 不做全局字符串猜测
 
-- 逻辑上，一个请求模型名
-- 物理上，多条真实通道分流
+不会因为名字长得像就自动视为同义。
 
-### Claude Opus 示例
+默认不会做：
 
-如果 metapi 里一个逻辑模型组展开为两个真实来源：
+- 全局转小写
+- 全局点横线互转
+- 仅凭大小写不同就自动合并
+- 仅凭名字相似就自动合并
 
-- `claude-opus-4-6`
-- `anthropic:claude-opus-4-6`
-
-导出后会变成两条 row，例如：
-
-```text
-https://code.claudex.us.ci|3|acct-19|account-secret|claude-opus-4-6|src-claude-opus-4-6|codex
-https://code.claudex.us.ci|3|acct-19|account-secret|claude-opus-4-6|src-anthropic-claude-opus-4-6|codex
-```
-
-它们的共同特点是：
-
-- `models` 都是 `claude-opus-4-6`
-- 名称里保留不同的 `src-*` 后缀
-- ccload 可以用一个模型名把流量打到两条真实通道
-
-## canonical model 规则
-
-canonical model 的处理是保守的，不做全局归一。
-
-### 会做的事
-
-对于同一个 `explicit_group` 内的多个真实来源：
-
-- 优先选择无供应商前缀的模型名作为 `canonicalModel`
-- 例如 `claude-opus-4-6` 会优先于 `anthropic:claude-opus-4-6`
-- 在展开 `explicit_group` 时，只接受和逻辑模型显式兼容的真实模型
-- 兼容规则只允许：完全相同、去掉供应商前缀后相同、或点/下划线与横线差异
-
-### 不会做的事
-
-脚本不会做这些危险归一：
-
-- 不会全局转小写
-- 不会全局把 `.` 自动变成 `-`
-- 不会因为名字看起来接近就自动判定为同一个模型
-- 不会因为只有大小写不同就把两个模型视为同义
-
-### GLM 大小写示例
-
-下面这些不会被自动视为同义：
+例如：
 
 - `GLM-5`
 - `glm-5`
 
-只有 metapi 里明确通过同一个逻辑 group/source 关系表达它们属于同一个入口时，才会共享请求模型名；否则会各自独立导出。
+默认不会互相映射。只有 metapi 自己通过 `explicit_group`、binding 链或 `modelMapping` 明确表达关系时，才会共享 canonical request model。
 
-这能避免出现这种假象：
+### 3. `model_redirects` 必须能把请求名打到真实 source model
 
-```text
-一个 default key 同时被标成支持 glm-5,GLM-5
+如果某条 row：
+
+- `models=glm-5`
+- 但真实 source model 是 `GLM-5`
+
+那么这条 row 会写出：
+
+```json
+{"glm-5":"GLM-5"}
 ```
 
-## merge / split 的新语义
+同理，如果：
 
-### split
+- `models=deepseek-v3.1`
+- 真实 source model 是 `deepseek-ai/deepseek-v3.1`
 
-`split` 模式下：
+则会写出：
 
-- 一个 source entry
-- 一个 canonical model
-- 一条 ccload row
+```json
+{"deepseek-v3.1":"deepseek-ai/deepseek-v3.1"}
+```
 
-也就是说，source entry 会完整拆开。
+这样 ccload 才能用统一后的请求模型名，真正打到这条 row 的上游模型。
 
-### merge
+---
 
-`merge` 模式下：
+## 当前支持的两种主要导出模式
 
-- 只允许在同一个 source entry 内合并多个 canonical model
-- 不允许跨 `rawSourceModel`
-- 不允许跨 concrete route
+### 模式 A：`logical-bundle + canonical-merge`
 
-这是为了确保“模型列的合并”不会重新变成“真实来源的合并”。
+用途：
 
-## 渠道命名规则
+- 导出单个或全部 `explicit_group`
+- 保留多 source 分流
+- 让同一个 logical group 的多条 row 共享同一个 canonical request model
 
-当前默认名称格式为：
+特点：
+
+- 每个 source entry 仍然单独成 row
+- 不做同渠多模型合并
+
+### 模式 B：`shared-credential + merge`
+
+用途：
+
+- 在同一个真实渠道上，安全合并多个 logical models
+- 当前最典型的例子是：
+  - `gpt-5.4`
+  - `gpt-5.3-codex`
+
+特点：
+
+- 只在同一个 shared credential 下尝试合并
+- 只允许**显式允许的一组模型**合并
+- 只要某个 logical model 在该真实渠道上是多值能力，就拒绝合并并给 warning
+- 不会把其他 explicit_group 顺带吞进同一条多模型 row
+
+---
+
+## 典型场景
+
+### 场景 1：`glm-5` / `GLM-5`
+
+如果 metapi 明确把它们放在同一个 `explicit_group`：
+
+- `models` 会统一成 `glm-5`
+- source row 仍然拆开
+- 如果某条 row 的真实 source model 是 `GLM-5`，则会写：
+
+```json
+{"glm-5":"GLM-5"}
+```
+
+### 场景 2：`deepseek-v3.1`
+
+如果某条 row 的真实 source model 是 `deepseek-ai/deepseek-v3.1`，导出后会是：
+
+- `models=deepseek-v3.1`
+- `model_redirects={"deepseek-v3.1":"deepseek-ai/deepseek-v3.1"}`
+
+### 场景 3：`gpt-5.4` + `gpt-5.3-codex`
+
+如果它们在同一个真实渠道上都是单值能力，那么允许导出成一条多模型 row：
+
+- 通道 A → `models=gpt-5.3-codex,gpt-5.4`
+- 通道 B 只支持 `gpt-5.4` → `models=gpt-5.4`
+
+但如果某个模型在该真实渠道上其实展开成多 source，就会跳过 merge 并给 warning。
+
+---
+
+## 参数速查
+
+### `--models`
+
+手工指定要导出的 logical models。
+
+### `--explicit-groups-only`
+
+自动从备份里选出全部 `explicit_group` 的 logical models。
+
+### `--entry-mode`
+
+常用值：
+
+- `logical-bundle`
+- `shared-credential`
+
+### `--model-pack-mode`
+
+常用值：
+
+- `canonical-merge`
+- `merge`
+
+### `--compat-policy`
+
+常用值：
+
+- `metapi-inferred`
+- `bundle-or-metapi-inferred`
+
+### `--model-mode`
+
+旧兼容参数，仍然保留，但不建议再用它理解当前规则。
+
+---
+
+## 最常用命令
+
+### 导出全部 explicit_group，保留多 source 分流
+
+```bash
+bun scripts/metapi-to-ccload.ts \
+  --input "./path/to/metapi-backup.json" \
+  --explicit-groups-only \
+  --channel-types codex \
+  --entry-mode logical-bundle \
+  --model-pack-mode canonical-merge \
+  --compat-policy metapi-inferred \
+  --preview --yes
+```
+
+### 导出全部 explicit_group，并同时允许 GPT pair 同渠安全合并
+
+```bash
+bun scripts/metapi-to-ccload.ts \
+  --input "./path/to/metapi-backup.json" \
+  --explicit-groups-only \
+  --channel-types openai,codex \
+  --entry-mode shared-credential \
+  --model-pack-mode merge \
+  --compat-policy bundle-or-metapi-inferred \
+  --yes
+```
+
+### 只测试 `gpt-5.4` / `gpt-5.3-codex` 同渠合并
+
+```bash
+bun scripts/metapi-to-ccload.ts \
+  --input "./path/to/metapi-backup.json" \
+  --models gpt-5.4,gpt-5.3-codex \
+  --channel-types codex \
+  --entry-mode shared-credential \
+  --model-pack-mode merge \
+  --compat-policy bundle-only \
+  --preview --yes
+```
+
+---
+
+## 推荐用法
+
+如果你的目标是：
+
+- 导出所有 `explicit_group`
+- 保留多真实来源分流
+- 尽量统一请求模型名
+- 同时让 `gpt-5.4,gpt-5.3-codex` 在安全时合并
+
+推荐直接用：
 
 ```text
-site.url|label|acct-<id>|account-secret|models|src-<source>|channel_type
+--explicit-groups-only
+--entry-mode shared-credential
+--model-pack-mode merge
+--compat-policy bundle-or-metapi-inferred
 ```
+
+---
+
+## FAQ
+
+### 为什么同一个模型会导出成多条 row？
+
+因为一条 row 代表一个真实 source entry，而不是一个逻辑模型本身。
+
+如果一个 logical model 下面挂了多个真实来源，那么导出后就会有多条 row。
+
+这不是重复，而是保留分流能力。
+
+### 为什么有些 row 的 `model_redirects` 是 `{}`？
+
+因为这条 row 的请求模型名已经和真实 source model 一致了，不需要再做改写。
+
+只有当：
+
+- `models` 写的是统一后的 logical canonical
+- 但真实 source model 是另一个名字
+
+才需要写 `model_redirects`。
 
 例如：
 
-```text
-https://code.claudex.us.ci|3|acct-19|account-secret|claude-opus-4-6|src-anthropic-claude-opus-4-6|codex
+- `models=glm-5`
+- 真实 source model = `GLM-5`
+
+这时才会出现：
+
+```json
+{"glm-5":"GLM-5"}
 ```
 
-字段含义：
+### 为什么 `gpt-5.4,gpt-5.3-codex` 可以合并，但 `deepseek-v3.2` 不一定能？
 
-- 第 1 段：站点 URL
-- 第 2 段：优先使用 token 名，其次使用账号名，再次使用站点名
-- 第 3 段：账号 ID
-- 第 4 段：固定保留为 `account-secret`
-- 第 5 段：`models` 列里实际写入的模型名或模型列表
-- 第 6 段：真实来源后缀 `src-*`，用于区分不同 source row
-- 第 7 段：`channel_type`
+因为 `gpt-5.4` 和 `gpt-5.3-codex` 是显式允许的 merge group，并且只有在同一个真实渠道上都是单值能力时才会合并。
 
-补充说明：
+而 `deepseek-v3.2` 在某些真实渠道上会展开成多个 source model，这种情况下会被判定为多值 logical model，系统会拒绝合并并给 warning。
 
-- `src-*` 后缀只用于名称区分，不参与 canonical model 归一
-- 这里会保留大小写差异，避免 `GLM-5` 和 `glm-5` 在名称后缀里再次撞名
+一句话理解：
 
-如果开启“在渠道名后追加 profile 名”，则会在最后再追加：
-
-```text
-|profile-name
-```
-
-## model_redirects 的行为
-
-导出时会综合两类信息：
-
-- 原始 `route.modelMapping`
-- 当前 source entry 内部的 alias 关系
-
-alias 候选包括：
-
-- `requestedModel`
-- `logicalModel`
-- `concreteModel`
-- `rawSourceModel`
-
-如果这些名字和 `canonicalModel` 不同，就会尽量写入 `model_redirects`。
-
-对于只有一个 canonical model 的 source entry，这能让逻辑别名继续指向统一请求模型名。
-
-## 当前支持的渠道类型
-
-项目按当前 ccload 约定，把 `channel_type` 视为渠道的“协议类型/使用类型标签”。
-
-常见值包括：
-
-- `openai`
-- `codex`
-- `anthropic`
-- `gemini`
-
-脚本不会强行限制只能使用这几个值。
-
-## 运行环境
-
-推荐使用：
-
-- `bun`
-
-本项目脚本是一个零依赖 TypeScript CLI，默认使用 Bun 直接运行。
-
-## 输入与输出
-
-### 输入
-
-输入文件是 metapi 备份 JSON，例如：
-
-```bash
-metapi-backup-2026-04-02.json
-```
-
-### 输出
-
-输出文件是 ccload CSV，例如：
-
-```bash
-metapi-backup-2026-04-02.ccload.csv
-```
-
-或者按 profile 分文件输出：
-
-```bash
-metapi-backup-2026-04-02.ccload.gpt-merge.csv
-metapi-backup-2026-04-02.ccload.gpt-split.csv
-```
-
-## 使用方式
-
-### 交互模式
-
-最推荐的方式：
-
-```bash
-bun scripts/metapi-to-ccload.ts
-```
-
-脚本会自动：
-
-- 查找当前目录下最新的 `metapi-backup-*.json`
-- 让你输入 profile 数量
-- 逐个输入：
-  - profile 名称
-  - 模型列表
-  - 模型模式 `merge/split`
-  - 渠道类型列表
-- 再选择：
-  - 输出模式
-  - 是否去重
-  - 是否追加 profile 名
-  - 是否仅预览
-
-### 单 profile 命令行模式
-
-适合脚本化调用：
-
-```bash
-bun scripts/metapi-to-ccload.ts \
-  --input metapi-backup-2026-04-02.json \
-  --models gpt-5.4,gpt-5.3-codex \
-  --channel-types codex,openai \
-  --model-mode merge \
-  --output /tmp/metapi-merge.csv \
-  --yes
-```
-
-### 仅预览，不写入文件
-
-```bash
-bun scripts/metapi-to-ccload.ts \
-  --input "metapi-backup-2026-04-03 (3).json" \
-  --models claude-opus-4.6,glm-5,GLM-5 \
-  --channel-types codex \
-  --model-mode split \
-  --preview \
-  --yes
-```
-
-### 按 profile 分文件输出
-
-```bash
-bun scripts/metapi-to-ccload.ts --output-mode per-profile
-```
-
-## 常用参数
-
-```bash
--i, --input <file>           metapi 备份 JSON 路径
--o, --output <file>          输出 ccload CSV 路径或基础路径
--m, --models <list>          单个 profile 的模型列表，逗号分隔
--t, --channel-types <list>   单个 profile 的渠道类型列表，逗号分隔
-    --model-mode <mode>      merge | split
-    --profile-name <name>    单 profile 模式下自定义 profile 名称
-    --append-profile-name    在渠道名后追加 profile 名
-    --dedupe                 去除完全重复的输出行
-    --output-mode <mode>     single | per-profile
-    --preview                仅预览，不写入文件
--y, --yes                    跳过最终确认
--h, --help                   查看帮助
-```
-
-## 验收关注点
-
-重构后的导出结果应满足：
-
-- `explicit_group` 导出后是多条 row，而不是一条混合 row
-- 多条 row 可以共享同一个 `canonicalModel`
-- row 名称能区分不同 source
-- `GLM-5` / `glm-5` 不再错误合并
-- 导出逻辑里明确保留 logical model 和 concrete/source model 的区别
-- merge/split 只影响同一个真实 source entry 的模型列写法，不再跨 source entry 合并
-
-## 风险与注意事项
-
-### 1. 这是转换器，不是协议探测器
-
-脚本会按配置生成指定的 `channel_type`，例如：
-
-- `openai`
-- `codex`
-- `anthropic`
-- `gemini`
-
-但脚本不会自动保证某个站点一定真实兼容该类型。
-
-### 2. accessToken 仍然只是兜底
-
-如果 token 和 `apiToken` 都缺失，脚本会回退使用 `accessToken`。
-
-这只是保守兜底，并不保证目标站点一定接受它作为 ccload `api_key`。
-
-### 3. model_redirects 不是万能别名系统
-
-只有在当前 source entry 语义明确时，alias 才会被写入 redirect。
-
-脚本不会为跨 source entry 的模糊别名关系做强行归一。
+- GPT 这组是“安全时可合并”
+- DeepSeek 这组是“只要多值就必须拆条”

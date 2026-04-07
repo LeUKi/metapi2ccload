@@ -6,29 +6,6 @@ import process from 'node:process';
 import { createInterface } from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
 
-/**
- * 这个脚本用于把 metapi 备份转换成一个或多个 ccload CSV 导出文件。
- *
- * 核心思路：
- * 1. metapi 里的 `tokenRoute` 本身不是最终的 ccload 渠道。
- * 2. ccload 渠道要从展平后的上游通道组生成：
- *      site + account + token-or-fallback-secret
- * 3. 一个通道组可以根据用户选择的转换配置扇出成多条 ccload 记录：
- *      - 模型模式：merge 或 split
- *      - 渠道类型：一个或多个
- *
- * 扇出示例：
- * - 模型列表：gpt-5.4,gpt-5.3-codex
- * - 模型模式：split
- * - 渠道类型：codex,openai
- *
- * 如果某个通道组同时支持两个模型，则会变成四条记录：
- * - gpt-5.4 + codex
- * - gpt-5.4 + openai
- * - gpt-5.3-codex + codex
- * - gpt-5.3-codex + openai
- */
-
 interface MetapiBackup {
   version: string;
   timestamp: number;
@@ -163,14 +140,21 @@ interface SettingItem {
 }
 
 type ModelMode = 'merge' | 'split';
+type EntryMode = 'strict-source' | 'shared-credential' | 'logical-bundle';
+type ModelPackMode = 'split' | 'merge' | 'canonical-merge';
+type CompatPolicy = 'strict' | 'bundle-only' | 'alias-map' | 'metapi-inferred' | 'bundle-or-metapi-inferred';
 type OutputMode = 'single' | 'per-profile';
 
 interface CliArgs {
   input?: string;
   output?: string;
   models?: string[];
+  explicitGroupsOnly?: boolean;
   channelTypes?: string[];
   modelMode?: ModelMode;
+  entryMode?: EntryMode;
+  modelPackMode?: ModelPackMode;
+  compatPolicy?: CompatPolicy;
   profileName?: string;
   appendProfileNameToName?: boolean;
   dedupeExactRows?: boolean;
@@ -182,7 +166,10 @@ interface CliArgs {
 interface ConversionProfile {
   name: string;
   models: string[];
-  modelMode: ModelMode;
+  modelMode?: ModelMode;
+  entryMode: EntryMode;
+  modelPackMode: ModelPackMode;
+  compatPolicy: CompatPolicy;
   channelTypes: string[];
 }
 
@@ -237,12 +224,49 @@ interface ResolvedChannelEntry {
   routeChannelId: number;
   rawSourceModel: string;
   canonicalModel: string;
+  inferredCanonicalModel: string;
+  canonicalModels: Set<string>;
   aliasModels: Set<string>;
+  bundleIds: Set<string>;
   modelMappings: string[];
   priority: number;
   weight: number;
   routeChannelEnabled: boolean;
   hasSuspiciousPlatform: boolean;
+}
+
+interface ModelBundle {
+  id: string;
+  canonical: string;
+  members: string[];
+  aliases?: string[];
+}
+
+interface MergeGroup {
+  id: string;
+  members: string[];
+}
+
+interface AggregatedBucket {
+  bucketKey: string;
+  site: Site;
+  account: Account;
+  token: AccountToken | null;
+  apiKey: string;
+  keySource: ApiKeySource;
+  sourceEntries: ResolvedChannelEntry[];
+  requestedModels: Set<string>;
+  logicalModels: Set<string>;
+  rawSourceModels: Set<string>;
+  canonicalModels: Set<string>;
+  aliasModels: Set<string>;
+  bundleIds: Set<string>;
+  modelMappings: string[];
+  priority: number;
+  routeChannelEnabled: boolean;
+  hasSuspiciousPlatform: boolean;
+  primaryCanonicalModel: string;
+  nameSourceSuffix: string;
 }
 
 type ApiKeySource = 'token' | 'apiToken' | 'accessToken' | 'missing';
@@ -266,6 +290,8 @@ interface CcloadRow extends CcloadRowDraft {
 interface ProfileConversionResult {
   profile: ConversionProfile;
   entries: ResolvedChannelEntry[];
+  buckets: AggregatedBucket[];
+  outputBuckets: AggregatedBucket[];
   resolutions: ModelResolution[];
   warnings: string[];
   rowDrafts: CcloadRowDraft[];
@@ -280,9 +306,25 @@ interface PreparedOutput {
 const DEFAULT_MODELS = ['gpt-5.4', 'gpt-5.3-codex'];
 const DEFAULT_CHANNEL_TYPES = ['codex', 'openai'];
 const DEFAULT_MODEL_MODE: ModelMode = 'merge';
+const DEFAULT_ENTRY_MODE: EntryMode = 'strict-source';
+const DEFAULT_MODEL_PACK_MODE: ModelPackMode = 'merge';
+const DEFAULT_COMPAT_POLICY: CompatPolicy = 'strict';
 const DEFAULT_OUTPUT_MODE: OutputMode = 'single';
 const SUSPICIOUS_PLATFORMS = new Set(['claude', 'anyrouter']);
 const SAFE_PLATFORMS = new Set(['openai', 'new-api', 'sub2api']);
+const MERGE_GROUPS: MergeGroup[] = [
+  {
+    id: 'gpt-codex-family',
+    members: ['gpt-5.4', 'gpt-5.3-codex'],
+  },
+];
+const MODEL_BUNDLES: ModelBundle[] = [
+  {
+    id: 'claude-opus-46',
+    canonical: 'claude-opus-4-6',
+    members: ['claude-opus-4-6', 'anthropic:claude-opus-4-6', 'claude-opus-4.6'],
+  },
+];
 const CSV_HEADERS: Array<keyof CcloadRow> = [
   'id',
   'name',
@@ -383,6 +425,9 @@ function parseCliArgs(argv: string[]): CliArgs {
         args.models = splitCommaSeparated(expectValue(current, next));
         index += 1;
         break;
+      case '--explicit-groups-only':
+        args.explicitGroupsOnly = true;
+        break;
       case '--channel-types':
       case '-t':
         args.channelTypes = splitCommaSeparated(expectValue(current, next));
@@ -390,6 +435,18 @@ function parseCliArgs(argv: string[]): CliArgs {
         break;
       case '--model-mode':
         args.modelMode = parseModelMode(expectValue(current, next));
+        index += 1;
+        break;
+      case '--entry-mode':
+        args.entryMode = parseEntryMode(expectValue(current, next));
+        index += 1;
+        break;
+      case '--model-pack-mode':
+        args.modelPackMode = parseModelPackMode(expectValue(current, next));
+        index += 1;
+        break;
+      case '--compat-policy':
+        args.compatPolicy = parseCompatPolicy(expectValue(current, next));
         index += 1;
         break;
       case '--profile-name':
@@ -442,8 +499,12 @@ function printHelpAndExit(): never {
   -i, --input <file>           metapi 备份 JSON 路径
   -o, --output <file>          输出 ccload CSV 路径或基础路径
   -m, --models <list>          单个 profile 的模型列表，使用逗号分隔
+      --explicit-groups-only   自动选择备份里全部 explicit_group 的 logical models
   -t, --channel-types <list>   单个 profile 的 ccload channel_type 列表，使用逗号分隔
-      --model-mode <mode>      merge | split
+      --model-mode <mode>      旧兼容参数：merge | split
+      --entry-mode <mode>      strict-source | shared-credential | logical-bundle
+      --model-pack-mode <mode> split | merge | canonical-merge
+      --compat-policy <mode>   strict | bundle-only | alias-map | metapi-inferred | bundle-or-metapi-inferred
       --profile-name <name>    单 profile CLI 模式下可选的 profile 名称
       --append-profile-name    把 profile 名追加到渠道名称中
       --dedupe                 在当前输出范围内去除完全重复的行
@@ -454,7 +515,9 @@ function printHelpAndExit(): never {
 
 示例：
   bun scripts/metapi-to-ccload.ts
+  bun scripts/metapi-to-ccload.ts --explicit-groups-only -t codex --entry-mode logical-bundle --model-pack-mode canonical-merge --compat-policy metapi-inferred --preview --yes
   bun scripts/metapi-to-ccload.ts -m gpt-5.4,gpt-5.3-codex -t codex,openai --model-mode split
+  bun scripts/metapi-to-ccload.ts -m gpt-5.4,gpt-5.3-codex -t codex,openai --entry-mode shared-credential --model-pack-mode merge --compat-policy bundle-only
   bun scripts/metapi-to-ccload.ts --output-mode per-profile --append-profile-name
   bun scripts/metapi-to-ccload.ts --preview
 `);
@@ -467,6 +530,67 @@ function parseModelMode(value: string): ModelMode {
   }
 
   throw new Error(`无效的模型模式：${value}。期望值为 merge 或 split。`);
+}
+
+function parseEntryMode(value: string): EntryMode {
+  if (value === 'strict-source' || value === 'shared-credential' || value === 'logical-bundle') {
+    return value;
+  }
+
+  throw new Error(
+    `无效的 entry mode：${value}。期望值为 strict-source、shared-credential 或 logical-bundle。`,
+  );
+}
+
+function parseModelPackMode(value: string): ModelPackMode {
+  if (value === 'split' || value === 'merge' || value === 'canonical-merge') {
+    return value;
+  }
+
+  throw new Error(
+    `无效的 model pack mode：${value}。期望值为 split、merge 或 canonical-merge。`,
+  );
+}
+
+function parseCompatPolicy(value: string): CompatPolicy {
+  if (
+    value === 'strict' ||
+    value === 'bundle-only' ||
+    value === 'alias-map' ||
+    value === 'metapi-inferred' ||
+    value === 'bundle-or-metapi-inferred'
+  ) {
+    return value;
+  }
+
+  throw new Error(
+    `无效的 compat policy：${value}。期望值为 strict、bundle-only、alias-map、metapi-inferred 或 bundle-or-metapi-inferred。`,
+  );
+}
+
+function normalizeProfileModes(params: {
+  modelMode?: ModelMode;
+  entryMode?: EntryMode;
+  modelPackMode?: ModelPackMode;
+  compatPolicy?: CompatPolicy;
+}): { entryMode: EntryMode; modelPackMode: ModelPackMode; compatPolicy: CompatPolicy } {
+  if (params.entryMode || params.modelPackMode || params.compatPolicy) {
+    return {
+      entryMode: params.entryMode ?? DEFAULT_ENTRY_MODE,
+      modelPackMode: params.modelPackMode ?? mapLegacyModelModeToPackMode(params.modelMode),
+      compatPolicy: params.compatPolicy ?? DEFAULT_COMPAT_POLICY,
+    };
+  }
+
+  return {
+    entryMode: DEFAULT_ENTRY_MODE,
+    modelPackMode: mapLegacyModelModeToPackMode(params.modelMode),
+    compatPolicy: DEFAULT_COMPAT_POLICY,
+  };
+}
+
+function mapLegacyModelModeToPackMode(modelMode: ModelMode | undefined): ModelPackMode {
+  return (modelMode ?? DEFAULT_MODEL_MODE) === 'split' ? 'split' : 'merge';
 }
 
 function parseOutputMode(value: string): OutputMode {
@@ -503,23 +627,39 @@ async function buildRuntimeConfig(params: {
   backup: MetapiBackup;
   inputPath: string;
 }): Promise<RuntimeConfig> {
-  const { cliArgs, inputPath } = params;
+  const { cliArgs, inputPath, backup } = params;
+
+  const selectedModels =
+    cliArgs.models ??
+    (cliArgs.explicitGroupsOnly ? collectExplicitGroupLogicalModels(backup.accounts.tokenRoutes) : undefined);
 
   // 完整指定参数的单 profile CLI 模式仍然保留，方便自动化调用。
   // 如果调用方传入了旧式模型/渠道参数，就把它视为一个
   // 单 profile 导出任务，并跳过交互式 profile 配置流程。
-  if (cliArgs.models && cliArgs.channelTypes) {
+  if (selectedModels && cliArgs.channelTypes) {
+    const normalizedModes = normalizeProfileModes({
+      modelMode: cliArgs.modelMode,
+      entryMode: cliArgs.entryMode,
+      modelPackMode: cliArgs.modelPackMode,
+      compatPolicy: cliArgs.compatPolicy,
+    });
+
     const profile: ConversionProfile = {
       name:
         cliArgs.profileName ||
         buildDefaultProfileName({
           index: 1,
-          models: cliArgs.models,
-          modelMode: cliArgs.modelMode ?? DEFAULT_MODEL_MODE,
+          models: selectedModels,
+          modelMode: cliArgs.modelMode,
+          entryMode: normalizedModes.entryMode,
+          modelPackMode: normalizedModes.modelPackMode,
           channelTypes: cliArgs.channelTypes,
         }),
-      models: cliArgs.models,
-      modelMode: cliArgs.modelMode ?? DEFAULT_MODEL_MODE,
+      models: selectedModels,
+      modelMode: cliArgs.modelMode,
+      entryMode: normalizedModes.entryMode,
+      modelPackMode: normalizedModes.modelPackMode,
+      compatPolicy: normalizedModes.compatPolicy,
       channelTypes: cliArgs.channelTypes,
     };
 
@@ -559,11 +699,16 @@ async function buildRuntimeConfig(params: {
       const previousProfile = profiles.at(-1);
       const defaultModels = previousProfile?.models ?? DEFAULT_MODELS;
       const defaultModelMode = previousProfile?.modelMode ?? DEFAULT_MODEL_MODE;
+      const defaultEntryMode = previousProfile?.entryMode ?? DEFAULT_ENTRY_MODE;
+      const defaultModelPackMode = previousProfile?.modelPackMode ?? DEFAULT_MODEL_PACK_MODE;
+      const defaultCompatPolicy = previousProfile?.compatPolicy ?? DEFAULT_COMPAT_POLICY;
       const defaultChannelTypes = previousProfile?.channelTypes ?? DEFAULT_CHANNEL_TYPES;
       const defaultName = buildDefaultProfileName({
         index: index + 1,
         models: defaultModels,
-        modelMode: defaultModelMode,
+        modelMode: previousProfile?.modelMode,
+        entryMode: defaultEntryMode,
+        modelPackMode: defaultModelPackMode,
         channelTypes: defaultChannelTypes,
       });
 
@@ -576,9 +721,27 @@ async function buildRuntimeConfig(params: {
       );
       const modelMode = await askChoice<ModelMode>({
         prompt,
-        message: `模型模式（merge/split）[${defaultModelMode}]: `,
+        message: `旧兼容模型模式（merge/split）[${defaultModelMode}]: `,
         defaultValue: defaultModelMode,
         choices: ['merge', 'split'],
+      });
+      const entryMode = await askChoice<EntryMode>({
+        prompt,
+        message: `entry-mode（strict-source/shared-credential/logical-bundle）[${defaultEntryMode}]: `,
+        defaultValue: defaultEntryMode,
+        choices: ['strict-source', 'shared-credential', 'logical-bundle'],
+      });
+      const modelPackMode = await askChoice<ModelPackMode>({
+        prompt,
+        message: `model-pack-mode（split/merge/canonical-merge）[${defaultModelPackMode}]: `,
+        defaultValue: defaultModelPackMode,
+        choices: ['split', 'merge', 'canonical-merge'],
+      });
+      const compatPolicy = await askChoice<CompatPolicy>({
+        prompt,
+        message: `compat-policy（strict/bundle-only/alias-map/metapi-inferred/bundle-or-metapi-inferred）[${defaultCompatPolicy}]: `,
+        defaultValue: defaultCompatPolicy,
+        choices: ['strict', 'bundle-only', 'alias-map', 'metapi-inferred', 'bundle-or-metapi-inferred'],
       });
       const channelTypes = splitCommaSeparated(
         await prompt.question(
@@ -591,6 +754,9 @@ async function buildRuntimeConfig(params: {
         name,
         models,
         modelMode,
+        entryMode,
+        modelPackMode,
+        compatPolicy,
         channelTypes,
       });
     }
@@ -646,12 +812,17 @@ function buildDefaultOutputPath(inputPath: string): string {
 function buildDefaultProfileName(params: {
   index: number;
   models: string[];
-  modelMode: ModelMode;
+  modelMode?: ModelMode;
+  entryMode: EntryMode;
+  modelPackMode: ModelPackMode;
   channelTypes: string[];
 }): string {
   const modelPart = slugify(params.models.join('-')) || `profile-${params.index}`;
   const typePart = slugify(params.channelTypes.join('-')) || 'types';
-  return `${modelPart}-${params.modelMode}-${typePart}`;
+  const modeLabel = params.modelMode
+    ? `legacy-${params.modelMode}`
+    : `${params.entryMode}-${params.modelPackMode}`;
+  return `${modelPart}-${slugify(modeLabel) || 'mode'}-${typePart}`;
 }
 
 function splitCommaSeparated(raw: string, fallback: string[] = []): string[] {
@@ -661,6 +832,17 @@ function splitCommaSeparated(raw: string, fallback: string[] = []): string[] {
     .filter(Boolean);
 
   return values.length > 0 ? Array.from(new Set(values)) : [...fallback];
+}
+
+function collectExplicitGroupLogicalModels(routes: TokenRoute[]): string[] {
+  return Array.from(
+    new Set(
+      routes
+        .filter((route) => route.routeMode === 'explicit_group')
+        .map((route) => route.modelPattern.trim())
+        .filter(Boolean),
+    ),
+  ).sort((left, right) => left.localeCompare(right));
 }
 
 function slugify(value: string): string {
@@ -789,10 +971,20 @@ function convertProfile(params: {
             canonicalModel,
           });
 
+        entry.canonicalModels.add(canonicalModel);
         entry.aliasModels.add(resolution.model);
         entry.aliasModels.add(binding.logicalModel);
         entry.aliasModels.add(binding.concreteModel);
         entry.aliasModels.add(rawSourceModel);
+        for (const bundleId of findBundleIdsForEntry({
+          requestedModel: resolution.model,
+          logicalModel: binding.logicalModel,
+          concreteModel: binding.concreteModel,
+          rawSourceModel,
+          canonicalModel,
+        })) {
+          entry.bundleIds.add(bundleId);
+        }
         entry.priority = Math.min(entry.priority, routeChannel.priority);
         entry.weight = Math.max(entry.weight, routeChannel.weight);
         entry.routeChannelEnabled = entry.routeChannelEnabled && routeChannel.enabled;
@@ -802,12 +994,17 @@ function convertProfile(params: {
           entry.modelMappings.push(concreteRoute.modelMapping);
         }
 
+        const inferredCanonicalModel = inferCanonicalModelFromEntry(entry);
+        entry.inferredCanonicalModel = inferredCanonicalModel;
+        entry.canonicalModels.add(inferredCanonicalModel);
+
         entryByKey.set(entryKey, entry);
       }
     }
   }
 
   const entries = Array.from(entryByKey.values()).sort(compareEntries);
+  const buckets = buildBuckets({ entries, profile });
   for (const entry of entries) {
     if (entry.keySource === 'missing') {
       warnings.push(`source entry ${entry.entryKey} 没有可用的 token/api key。`);
@@ -824,8 +1021,14 @@ function convertProfile(params: {
     }
   }
 
+  const outputBucketResult = buildOutputBuckets({
+    buckets,
+    profile,
+  });
+  warnings.push(...outputBucketResult.warnings);
+
   const rowDrafts = buildRowDrafts({
-    entries,
+    buckets: outputBucketResult.buckets,
     profile,
     appendProfileNameToName,
   });
@@ -833,6 +1036,8 @@ function convertProfile(params: {
   return {
     profile,
     entries,
+    buckets,
+    outputBuckets: outputBucketResult.buckets,
     resolutions,
     warnings: Array.from(new Set(warnings)).sort(),
     rowDrafts,
@@ -1056,12 +1261,23 @@ function createEmptyEntry(params: {
     routeChannelId: params.routeChannel.id,
     rawSourceModel: params.rawSourceModel,
     canonicalModel: params.canonicalModel,
+    inferredCanonicalModel: params.canonicalModel,
+    canonicalModels: new Set<string>([params.canonicalModel]),
     aliasModels: new Set<string>([
       params.binding.requestedModel,
       params.binding.logicalModel,
       params.binding.concreteModel,
       params.rawSourceModel,
     ]),
+    bundleIds: new Set<string>(
+      findBundleIdsForEntry({
+        requestedModel: params.binding.requestedModel,
+        logicalModel: params.binding.logicalModel,
+        concreteModel: params.binding.concreteModel,
+        rawSourceModel: params.rawSourceModel,
+        canonicalModel: params.canonicalModel,
+      }),
+    ),
     modelMappings: [],
     priority: params.routeChannel.priority,
     weight: params.routeChannel.weight,
@@ -1080,33 +1296,396 @@ function compareEntries(left: ResolvedChannelEntry, right: ResolvedChannelEntry)
   );
 }
 
-function buildRowDrafts(params: {
+function buildBuckets(params: {
   entries: ResolvedChannelEntry[];
+  profile: ConversionProfile;
+}): AggregatedBucket[] {
+  const entries = params.entries.map(enrichEntryWithInferredCanonical);
+  return entries.map((entry) => createStrictSourceBucket(entry)).sort(compareBuckets);
+}
+
+function buildOutputBuckets(params: {
+  buckets: AggregatedBucket[];
+  profile: ConversionProfile;
+}): { buckets: AggregatedBucket[]; warnings: string[] } {
+  const { buckets, profile } = params;
+  const logicalCanonicalMap = buildLogicalCanonicalMap(buckets, {
+    ...profile,
+    entryMode: 'logical-bundle',
+    modelPackMode: 'canonical-merge',
+  });
+
+  if (profile.entryMode !== 'shared-credential' || profile.modelPackMode !== 'merge') {
+    return { buckets: applyLogicalCanonicalMapToBuckets(buckets, logicalCanonicalMap), warnings: [] };
+  }
+
+  return mergeBucketsOnSharedCredential(applyLogicalCanonicalMapToBuckets(buckets, logicalCanonicalMap), profile);
+}
+
+function mergeBucketsOnSharedCredential(
+  buckets: AggregatedBucket[],
+  profile: ConversionProfile,
+): { buckets: AggregatedBucket[]; warnings: string[] } {
+  const mergeClusters = buildRequestedModelMergeClusters(profile.models);
+  const grouped = new Map<string, AggregatedBucket[]>();
+  for (const bucket of buckets) {
+    const key = buildSharedCredentialMergeKey(bucket);
+    const items = grouped.get(key) ?? [];
+    items.push(bucket);
+    grouped.set(key, items);
+  }
+
+  const mergedBuckets: AggregatedBucket[] = [];
+  const warnings: string[] = [];
+
+  for (const groupBuckets of grouped.values()) {
+    const partitionedBuckets = partitionBucketsByMergeCluster(groupBuckets, mergeClusters);
+    for (const partition of partitionedBuckets) {
+      const partitionWarnings = mergeSingleSharedCredentialPartition(partition);
+      mergedBuckets.push(...partitionWarnings.buckets);
+      warnings.push(...partitionWarnings.warnings);
+    }
+  }
+
+  return { buckets: mergedBuckets.sort(compareBuckets), warnings };
+}
+
+function mergeSingleSharedCredentialPartition(
+  groupBuckets: AggregatedBucket[],
+): { buckets: AggregatedBucket[]; warnings: string[] } {
+  const warnings: string[] = [];
+  const logicalBuckets = new Map<string, AggregatedBucket[]>();
+  for (const bucket of groupBuckets) {
+    const logicalKey = buildLogicalMergeKey(bucket);
+    const items = logicalBuckets.get(logicalKey) ?? [];
+    items.push(bucket);
+    logicalBuckets.set(logicalKey, items);
+  }
+
+  const ambiguousKeys = Array.from(logicalBuckets.entries())
+    .filter(([, items]) => items.length > 1)
+    .map(([logicalKey]) => logicalKey)
+    .sort();
+
+  if (ambiguousKeys.length > 0) {
+    warnings.push(
+      `shared-credential merge 已跳过：同一真实渠道上存在多值 logical model，无法安全合并（${ambiguousKeys.join(', ')}）。`,
+    );
+    return { buckets: groupBuckets, warnings };
+  }
+
+  if (groupBuckets.length === 1) {
+    return { buckets: [groupBuckets[0]], warnings };
+  }
+
+  return { buckets: [createMergedSharedCredentialBucket(groupBuckets)], warnings };
+}
+
+function buildRequestedModelMergeClusters(models: string[]): Map<string, string> {
+  const clusters = new Map<string, string>();
+  for (const model of models) {
+    clusters.set(model, `single:${model}`);
+  }
+
+  for (const mergeGroup of MERGE_GROUPS) {
+    const membersInProfile = mergeGroup.members.filter((member) => models.includes(member));
+    if (membersInProfile.length < 2) {
+      continue;
+    }
+
+    for (const member of membersInProfile) {
+      clusters.set(member, `merge:${mergeGroup.id}`);
+    }
+  }
+
+  return clusters;
+}
+
+function applyLogicalCanonicalMapToBuckets(
+  buckets: AggregatedBucket[],
+  logicalCanonicalMap: Map<number, string>,
+): AggregatedBucket[] {
+  return buckets.map((bucket) => {
+    const canonicalModel = resolveLogicalCanonicalModel(bucket, logicalCanonicalMap);
+    if (!canonicalModel) {
+      return bucket;
+    }
+
+    return {
+      ...bucket,
+      canonicalModels: new Set<string>([canonicalModel]),
+      primaryCanonicalModel: canonicalModel,
+    };
+  });
+}
+
+function partitionBucketsByMergeCluster(
+  buckets: AggregatedBucket[],
+  mergeClusters: Map<string, string>,
+): AggregatedBucket[][] {
+  const partitions = new Map<string, AggregatedBucket[]>();
+  for (const bucket of buckets) {
+    const requestedModel = bucket.sourceEntries[0]?.requestedModel ?? '';
+    const cluster = mergeClusters.get(requestedModel) ?? `single:${requestedModel}`;
+    const items = partitions.get(cluster) ?? [];
+    items.push(bucket);
+    partitions.set(cluster, items);
+  }
+
+  return Array.from(partitions.values());
+}
+
+function buildSharedCredentialMergeKey(bucket: AggregatedBucket): string {
+  const tokenPart = bucket.token ? `token:${bucket.token.id}` : 'token:fallback-account-secret';
+  return [bucket.site.url, bucket.account.id, tokenPart, bucket.apiKey, bucket.keySource].join('|');
+}
+
+function buildLogicalMergeKey(bucket: AggregatedBucket): string {
+  const entry = bucket.sourceEntries[0];
+  return `${entry.requestedModel}|logical:${entry.logicalRouteId}`;
+}
+
+function createMergedSharedCredentialBucket(groupBuckets: AggregatedBucket[]): AggregatedBucket {
+  const sortedBuckets = [...groupBuckets].sort(compareBuckets);
+  const first = sortedBuckets[0];
+  const merged: AggregatedBucket = {
+    bucketKey: `${first.bucketKey}|shared-merged`,
+    site: first.site,
+    account: first.account,
+    token: first.token,
+    apiKey: first.apiKey,
+    keySource: first.keySource,
+    sourceEntries: [],
+    requestedModels: new Set<string>(),
+    logicalModels: new Set<string>(),
+    rawSourceModels: new Set<string>(),
+    canonicalModels: new Set<string>(),
+    aliasModels: new Set<string>(),
+    bundleIds: new Set<string>(),
+    modelMappings: [],
+    priority: Number.POSITIVE_INFINITY,
+    routeChannelEnabled: true,
+    hasSuspiciousPlatform: false,
+    primaryCanonicalModel: '',
+    nameSourceSuffix: 'src-shared-credential',
+  };
+
+  for (const bucket of sortedBuckets) {
+    merged.sourceEntries.push(...bucket.sourceEntries);
+    for (const requestedModel of bucket.requestedModels) {
+      merged.requestedModels.add(requestedModel);
+    }
+    for (const logicalModel of bucket.logicalModels) {
+      merged.logicalModels.add(logicalModel);
+    }
+    for (const rawSourceModel of bucket.rawSourceModels) {
+      merged.rawSourceModels.add(rawSourceModel);
+    }
+    for (const canonicalModel of bucket.canonicalModels) {
+      merged.canonicalModels.add(canonicalModel);
+    }
+    for (const aliasModel of bucket.aliasModels) {
+      merged.aliasModels.add(aliasModel);
+    }
+    for (const bundleId of bucket.bundleIds) {
+      merged.bundleIds.add(bundleId);
+    }
+    merged.modelMappings.push(...bucket.modelMappings);
+    merged.priority = Math.min(merged.priority, bucket.priority);
+    merged.routeChannelEnabled = merged.routeChannelEnabled && bucket.routeChannelEnabled;
+    merged.hasSuspiciousPlatform = merged.hasSuspiciousPlatform || bucket.hasSuspiciousPlatform;
+  }
+
+  merged.primaryCanonicalModel = Array.from(merged.canonicalModels).sort()[0] ?? '';
+  return merged;
+}
+
+function enrichEntryWithInferredCanonical(entry: ResolvedChannelEntry): ResolvedChannelEntry {
+  const inferredCanonicalModel = inferCanonicalModelFromEntry(entry);
+  entry.inferredCanonicalModel = inferredCanonicalModel;
+  entry.canonicalModels.add(inferredCanonicalModel);
+  return entry;
+}
+
+function createStrictSourceBucket(entry: ResolvedChannelEntry): AggregatedBucket {
+  const bucket = createBucketFromEntry({
+    entry,
+    bucketKey: `strict|${entry.entryKey}`,
+  });
+
+  bucket.nameSourceSuffix = `src-${slugifySourceModel(entry.rawSourceModel)}`;
+  return bucket;
+}
+
+function createBucketFromEntry(params: {
+  entry: ResolvedChannelEntry;
+  bucketKey: string;
+}): AggregatedBucket {
+  const primaryCanonicalModel = pickPrimaryCanonicalModel({
+    canonicalModels: params.entry.canonicalModels,
+    bundleIds: params.entry.bundleIds,
+    inferredCanonicalModel: params.entry.inferredCanonicalModel,
+  });
+
+  return {
+    bucketKey: params.bucketKey,
+    site: params.entry.site,
+    account: params.entry.account,
+    token: params.entry.token,
+    apiKey: params.entry.apiKey,
+    keySource: params.entry.keySource,
+    sourceEntries: [params.entry],
+    requestedModels: new Set<string>([params.entry.requestedModel]),
+    logicalModels: new Set<string>([params.entry.logicalModel]),
+    rawSourceModels: new Set<string>([params.entry.rawSourceModel]),
+    canonicalModels: new Set<string>(params.entry.canonicalModels),
+    aliasModels: new Set<string>(params.entry.aliasModels),
+    bundleIds: new Set<string>(params.entry.bundleIds),
+    modelMappings: [...params.entry.modelMappings],
+    priority: params.entry.priority,
+    routeChannelEnabled: params.entry.routeChannelEnabled,
+    hasSuspiciousPlatform: params.entry.hasSuspiciousPlatform,
+    primaryCanonicalModel,
+    nameSourceSuffix: buildBucketSourceSuffix({
+      rawSourceModels: new Set<string>([params.entry.rawSourceModel]),
+    }),
+  };
+}
+
+function pickPreferredBundleId(bundleIds: Set<string>): string | undefined {
+  return Array.from(bundleIds).sort()[0];
+}
+
+function pickPrimaryCanonicalModel(params: {
+  canonicalModels: Set<string>;
+  bundleIds: Set<string>;
+  inferredCanonicalModel?: string;
+}): string {
+  const preferredBundleId = pickPreferredBundleId(params.bundleIds);
+  if (preferredBundleId) {
+    const bundle = MODEL_BUNDLES.find((item) => item.id === preferredBundleId);
+    if (bundle) {
+      return bundle.canonical;
+    }
+  }
+
+  if (params.inferredCanonicalModel) {
+    return params.inferredCanonicalModel;
+  }
+
+  return Array.from(params.canonicalModels).sort()[0] ?? '';
+}
+
+function buildBucketSourceSuffix(params: { rawSourceModels: Set<string> }): string {
+  if (params.rawSourceModels.size === 1) {
+    return `src-${slugifySourceModel(Array.from(params.rawSourceModels)[0])}`;
+  }
+
+  return 'packed';
+}
+
+function compareBuckets(left: AggregatedBucket, right: AggregatedBucket): number {
+  return left.bucketKey.localeCompare(right.bucketKey);
+}
+
+function findBundleIdsForEntry(models: {
+  requestedModel: string;
+  logicalModel: string;
+  concreteModel: string;
+  rawSourceModel: string;
+  canonicalModel: string;
+}): string[] {
+  const candidates = new Set<string>([
+    models.requestedModel,
+    models.logicalModel,
+    models.concreteModel,
+    models.rawSourceModel,
+    models.canonicalModel,
+  ]);
+
+  return MODEL_BUNDLES.filter((bundle) => bundle.members.some((member) => candidates.has(member))).map(
+    (bundle) => bundle.id,
+  );
+}
+
+function inferCanonicalModelFromEntry(entry: ResolvedChannelEntry): string {
+  const mappedCanonical = inferCanonicalFromModelMappings(entry.modelMappings, entry.aliasModels);
+  if (mappedCanonical) {
+    return mappedCanonical;
+  }
+
+  const structuralCanonical = pickCanonicalModel({
+    logicalModel: entry.logicalModel,
+    rawSourceModels: [entry.rawSourceModel, entry.concreteModel],
+  });
+
+  return structuralCanonical || entry.canonicalModel;
+}
+
+function inferCanonicalFromModelMappings(
+  modelMappings: string[],
+  aliasModels: Set<string>,
+): string | undefined {
+  const aliasCandidates = Array.from(aliasModels);
+  const redirectTargets = new Set<string>();
+
+  for (const mappingText of modelMappings) {
+    try {
+      const parsed = JSON.parse(mappingText) as unknown;
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        continue;
+      }
+
+      for (const [alias, value] of Object.entries(parsed)) {
+        if (typeof value !== 'string') {
+          continue;
+        }
+
+        if (aliasCandidates.includes(alias)) {
+          redirectTargets.add(value);
+        }
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  if (redirectTargets.size === 1) {
+    return Array.from(redirectTargets)[0];
+  }
+
+  return undefined;
+}
+
+function buildRowDrafts(params: {
+  buckets: AggregatedBucket[];
   profile: ConversionProfile;
   appendProfileNameToName: boolean;
 }): CcloadRowDraft[] {
-  const { entries, profile, appendProfileNameToName } = params;
+  const { buckets, profile, appendProfileNameToName } = params;
   const rows: CcloadRowDraft[] = [];
+  const logicalCanonicalMap = buildLogicalCanonicalMap(buckets, profile);
 
-  if (profile.modelMode === 'split') {
-    for (const entry of entries) {
+  if (profile.modelPackMode === 'split') {
+    for (const bucket of buckets) {
+      const modelLabel = Array.from(bucket.canonicalModels).sort().join(',');
       for (const channelType of profile.channelTypes) {
         rows.push({
           name: buildChannelName({
-            entry,
-            modelLabel: entry.canonicalModel,
+            entry: bucket,
+            modelLabel,
             channelType,
             profileName: profile.name,
             appendProfileNameToName,
           }),
-          api_key: entry.apiKey,
-          url: entry.site.url,
-          priority: String(entry.priority),
-          models: entry.canonicalModel,
-          model_redirects: JSON.stringify(buildMergedRedirects(entry)),
+          api_key: bucket.apiKey,
+          url: bucket.site.url,
+          priority: String(bucket.priority),
+          models: modelLabel,
+          model_redirects: JSON.stringify(buildBucketRedirects(bucket, profile.modelPackMode)),
           channel_type: channelType,
           key_strategy: 'sequential',
-          enabled: String(isEntryEnabled(entry)),
+          enabled: String(isBucketEnabled(bucket)),
         });
       }
     }
@@ -1114,31 +1693,109 @@ function buildRowDrafts(params: {
     return rows;
   }
 
-  const mergedEntries = mergeEntriesForProfile(entries);
-  for (const entry of mergedEntries) {
-    const modelLabel = Array.from(entry.canonicalModels).join(',');
+  for (const bucket of buckets) {
+    const resolvedCanonicalModel =
+      profile.entryMode === 'logical-bundle'
+        ? resolveLogicalCanonicalModel(bucket, logicalCanonicalMap)
+        : bucket.primaryCanonicalModel;
+    const modelLabel =
+      profile.modelPackMode === 'canonical-merge'
+        ? resolvedCanonicalModel
+        : Array.from(bucket.canonicalModels).sort().join(',');
     for (const channelType of profile.channelTypes) {
       rows.push({
         name: buildChannelName({
-          entry,
+          entry: bucket,
           modelLabel,
           channelType,
           profileName: profile.name,
           appendProfileNameToName,
         }),
-        api_key: entry.apiKey,
-        url: entry.site.url,
-        priority: String(entry.priority),
+        api_key: bucket.apiKey,
+        url: bucket.site.url,
+        priority: String(bucket.priority),
         models: modelLabel,
-        model_redirects: JSON.stringify(buildMergedRedirects(entry)),
+        model_redirects: JSON.stringify(
+          buildBucketRedirects(bucket, profile.modelPackMode, resolvedCanonicalModel),
+        ),
         channel_type: channelType,
         key_strategy: 'sequential',
-        enabled: String(isMergedEntryEnabled(entry)),
+        enabled: String(isBucketEnabled(bucket)),
       });
     }
   }
 
   return rows;
+}
+
+function buildLogicalCanonicalMap(
+  buckets: AggregatedBucket[],
+  profile: ConversionProfile,
+): Map<number, string> {
+  const canonicalByLogicalRoute = new Map<number, string>();
+  if (profile.entryMode !== 'logical-bundle' || profile.modelPackMode !== 'canonical-merge') {
+    return canonicalByLogicalRoute;
+  }
+
+  const bucketsByLogicalRoute = new Map<number, AggregatedBucket[]>();
+  for (const bucket of buckets) {
+    const logicalRouteId = bucket.sourceEntries[0]?.logicalRouteId;
+    if (!logicalRouteId) {
+      continue;
+    }
+
+    const group = bucketsByLogicalRoute.get(logicalRouteId) ?? [];
+    group.push(bucket);
+    bucketsByLogicalRoute.set(logicalRouteId, group);
+  }
+
+  for (const [logicalRouteId, groupBuckets] of bucketsByLogicalRoute.entries()) {
+    const bundleIds = new Set<string>();
+    const canonicalModels = new Set<string>();
+    const inferredCanonicalModels = new Set<string>();
+    const logicalModels = new Set<string>();
+
+    for (const bucket of groupBuckets) {
+      for (const bundleId of bucket.bundleIds) {
+        bundleIds.add(bundleId);
+      }
+      for (const canonicalModel of bucket.canonicalModels) {
+        canonicalModels.add(canonicalModel);
+      }
+      for (const sourceEntry of bucket.sourceEntries) {
+        inferredCanonicalModels.add(sourceEntry.inferredCanonicalModel);
+        logicalModels.add(sourceEntry.logicalModel);
+      }
+    }
+
+    canonicalByLogicalRoute.set(
+      logicalRouteId,
+      pickPrimaryCanonicalModel({
+        canonicalModels,
+        bundleIds,
+        inferredCanonicalModel:
+          logicalModels.size === 1
+            ? Array.from(logicalModels)[0]
+            : inferredCanonicalModels.size === 1
+              ? Array.from(inferredCanonicalModels)[0]
+              : Array.from(canonicalModels).sort()[0],
+      }),
+    );
+  }
+
+  return canonicalByLogicalRoute;
+}
+
+function resolveLogicalCanonicalModel(
+  bucket: AggregatedBucket,
+  logicalCanonicalMap: Map<number, string>,
+): string {
+  const logicalRouteId = bucket.sourceEntries[0]?.logicalRouteId;
+  if (!logicalRouteId) {
+    return bucket.primaryCanonicalModel;
+  }
+
+  return logicalCanonicalMap.get(logicalRouteId) ?? bucket.primaryCanonicalModel;
 }
 
 function pickCanonicalModel(params: { logicalModel: string; rawSourceModels: string[] }): string {
@@ -1193,7 +1850,7 @@ function buildAliasRedirects(entry: { canonicalModel: string; aliasModels: Set<s
 }
 
 function buildChannelName(params: {
-  entry: ResolvedChannelEntry | MergedChannelEntry;
+  entry: ResolvedChannelEntry | MergedChannelEntry | AggregatedBucket;
   modelLabel: string;
   channelType: string;
   profileName: string;
@@ -1211,7 +1868,7 @@ function buildChannelName(params: {
     `acct-${entry.account.id}`,
     'account-secret',
     modelLabel,
-    `src-${slugifySourceModel(entry.rawSourceModel)}`,
+    'nameSourceSuffix' in entry ? entry.nameSourceSuffix : `src-${slugifySourceModel(entry.rawSourceModel)}`,
     channelType,
   ];
 
@@ -1257,68 +1914,53 @@ interface MergedChannelEntry {
   hasSuspiciousPlatform: boolean;
 }
 
-function mergeEntriesForProfile(entries: ResolvedChannelEntry[]): MergedChannelEntry[] {
-  const mergedByKey = new Map<string, MergedChannelEntry>();
+function buildBucketRedirects(
+  bucket: AggregatedBucket,
+  modelPackMode: ModelPackMode,
+  canonicalModelOverride?: string,
+): Record<string, string> {
+  const redirects = mergeModelRedirects(bucket.modelMappings);
+  Object.assign(redirects, buildSourceEntryRedirects(bucket, canonicalModelOverride));
 
-  for (const entry of entries) {
-    // merge 模式只允许在同一个真实 source entry 内合并多个 canonical model，
-    // 不能跨 rawSourceModel 或 concrete route 回收成一条行。
-    const mergeKey = [
-      entry.site.url,
-      entry.account.id,
-      entry.token?.id ?? 'fallback-account-secret',
-      entry.rawSourceModel,
-      entry.apiKey,
-    ].join('|');
-
-    const existing = mergedByKey.get(mergeKey);
-    if (existing) {
-      existing.canonicalModels.add(entry.canonicalModel);
-      for (const aliasModel of entry.aliasModels) {
-        existing.aliasModels.add(aliasModel);
-      }
-      existing.modelMappings.push(...entry.modelMappings);
-      existing.priority = Math.min(existing.priority, entry.priority);
-      existing.routeChannelEnabled = existing.routeChannelEnabled && entry.routeChannelEnabled;
-      existing.hasSuspiciousPlatform = existing.hasSuspiciousPlatform || entry.hasSuspiciousPlatform;
-      continue;
-    }
-
-    mergedByKey.set(mergeKey, {
-      mergeKey,
-      site: entry.site,
-      account: entry.account,
-      token: entry.token,
-      apiKey: entry.apiKey,
-      keySource: entry.keySource,
-      rawSourceModel: entry.rawSourceModel,
-      canonicalModels: new Set<string>([entry.canonicalModel]),
-      aliasModels: new Set<string>(entry.aliasModels),
-      modelMappings: [...entry.modelMappings],
-      priority: entry.priority,
-      routeChannelEnabled: entry.routeChannelEnabled,
-      hasSuspiciousPlatform: entry.hasSuspiciousPlatform,
-    });
+  if (modelPackMode === 'canonical-merge') {
+    Object.assign(
+      redirects,
+      buildAliasRedirects({
+        canonicalModel: canonicalModelOverride ?? bucket.primaryCanonicalModel,
+        aliasModels: bucket.aliasModels,
+      }),
+    );
   }
 
-  return Array.from(mergedByKey.values()).sort((left, right) => left.mergeKey.localeCompare(right.mergeKey));
+  return redirects;
 }
 
-function buildMergedRedirects(entry: ResolvedChannelEntry | MergedChannelEntry): Record<string, string> {
-  if ('canonicalModels' in entry) {
-    const redirects = mergeModelRedirects(entry.modelMappings);
-    if (entry.canonicalModels.size === 1) {
-      // 只有单一 canonical model 时，alias -> canonical 的重定向才有明确指向。
-      const canonicalModel = Array.from(entry.canonicalModels)[0];
-      Object.assign(redirects, buildAliasRedirects({ canonicalModel, aliasModels: entry.aliasModels }));
+function buildSourceEntryRedirects(
+  bucket: AggregatedBucket,
+  canonicalModelOverride?: string,
+): Record<string, string> {
+  const redirects: Record<string, string> = {};
+
+  for (const entry of bucket.sourceEntries) {
+    const targetModel = entry.rawSourceModel;
+    const sourceAliases = new Set<string>(entry.aliasModels);
+    sourceAliases.add(entry.requestedModel);
+    sourceAliases.add(entry.logicalModel);
+    sourceAliases.add(entry.concreteModel);
+    sourceAliases.add(entry.inferredCanonicalModel);
+
+    if (bucket.sourceEntries.length === 1 && canonicalModelOverride) {
+      sourceAliases.add(canonicalModelOverride);
     }
-    return redirects;
+
+    for (const aliasModel of sourceAliases) {
+      if (aliasModel && aliasModel !== targetModel) {
+        redirects[aliasModel] = targetModel;
+      }
+    }
   }
 
-  return {
-    ...mergeModelRedirects(entry.modelMappings),
-    ...buildAliasRedirects(entry),
-  };
+  return redirects;
 }
 
 function isEntryEnabled(entry: ResolvedChannelEntry): boolean {
@@ -1336,6 +1978,14 @@ function isMergedEntryEnabled(entry: MergedChannelEntry): boolean {
   const tokenEnabled = entry.token ? entry.token.enabled : true;
 
   return entry.routeChannelEnabled && accountActive && siteActive && tokenEnabled && entry.apiKey.length > 0;
+}
+
+function isBucketEnabled(bucket: AggregatedBucket): boolean {
+  const accountActive = bucket.account.status === 'active';
+  const siteActive = bucket.site.status === 'active';
+  const tokenEnabled = bucket.token ? bucket.token.enabled : true;
+
+  return bucket.routeChannelEnabled && accountActive && siteActive && tokenEnabled && bucket.apiKey.length > 0;
 }
 
 function slugifySourceModel(value: string): string {
@@ -1458,9 +2108,13 @@ function printConversionSummary(params: {
 
     console.log(`\nProfile：${profileResult.profile.name}`);
     console.log(`- 模型列表：${profileResult.profile.models.join(', ')}`);
-    console.log(`- 模型模式：${profileResult.profile.modelMode}`);
+    console.log(`- 旧模型模式：${profileResult.profile.modelMode ?? 'none'}`);
+    console.log(`- entry-mode：${profileResult.profile.entryMode}`);
+    console.log(`- model-pack-mode：${profileResult.profile.modelPackMode}`);
+    console.log(`- compat-policy：${profileResult.profile.compatPolicy}`);
     console.log(`- 渠道类型：${profileResult.profile.channelTypes.join(', ')}`);
     console.log(`- source entry 数量：${profileResult.entries.length}`);
+    console.log(`- bucket 数量：${profileResult.buckets.length}`);
     console.log(`- 启用中的 source entry 数量：${enabledEntryCount}`);
     console.log(`- openai/new-api/sub2api 平台上的 source entry 数量：${safePlatformEntryCount}`);
     console.log(`- 输出级去重前的行数：${profileResult.rowDrafts.length}`);
@@ -1609,8 +2263,45 @@ async function confirmPrompt(message: string): Promise<boolean> {
   }
 }
 
-main().catch((error: unknown) => {
-  const message = error instanceof Error ? error.message : String(error);
-  console.error(`错误：${message}`);
-  process.exit(1);
-});
+function buildBucketsForTest(entries: ResolvedChannelEntry[], profile: ConversionProfile): AggregatedBucket[] {
+  return buildBuckets({ entries, profile });
+}
+
+function buildRowDraftsForTest(
+  buckets: AggregatedBucket[],
+  profile: ConversionProfile,
+  appendProfileNameToName = false,
+): CcloadRowDraft[] {
+  return buildRowDrafts({
+    buckets,
+    profile,
+    appendProfileNameToName,
+  });
+}
+
+function normalizeProfileModesForTest(params: {
+  modelMode?: ModelMode;
+  entryMode?: EntryMode;
+  modelPackMode?: ModelPackMode;
+  compatPolicy?: CompatPolicy;
+}): { entryMode: EntryMode; modelPackMode: ModelPackMode; compatPolicy: CompatPolicy } {
+  return normalizeProfileModes(params);
+}
+
+function buildOutputBucketsForTest(
+  buckets: AggregatedBucket[],
+  profile: ConversionProfile,
+): { buckets: AggregatedBucket[]; warnings: string[] } {
+  return buildOutputBuckets({ buckets, profile });
+}
+
+export { buildBucketsForTest, buildRowDraftsForTest, normalizeProfileModesForTest, buildOutputBucketsForTest };
+export { collectExplicitGroupLogicalModels as collectExplicitGroupLogicalModelsForTest };
+
+if (import.meta.main) {
+  main().catch((error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`错误：${message}`);
+    process.exit(1);
+  });
+}
