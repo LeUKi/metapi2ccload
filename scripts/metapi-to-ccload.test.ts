@@ -6,11 +6,13 @@ import {
   collectExplicitGroupLogicalModelsForTest,
   normalizeProfileModesForTest,
   buildOutputBucketsForTest,
+  resolveExportUrlsForSiteForTest,
 } from './metapi-to-ccload';
 
 function makeEntry(overrides: Record<string, unknown> = {}) {
   return {
     entryKey: 'entry-1',
+    resolvedUrl: 'https://example.com',
     site: { id: 1, url: 'https://example.com', platform: 'openai', status: 'active', name: 'site' },
     account: { id: 10, siteId: 1, status: 'active', username: 'acct', accessToken: 'acc', apiToken: 'api' },
     token: { id: 100, name: 'metapi', token: 'tok', enabled: true },
@@ -76,7 +78,203 @@ describe('explicit group selection', () => {
   });
 });
 
+describe('site API endpoint resolution', () => {
+  test('prefers enabled siteApiEndpoints over site.url', () => {
+    expect(
+      resolveExportUrlsForSiteForTest(
+        {
+          id: 64,
+          name: 'https://user.dd999.uk',
+          url: 'https://user.dd999.uk',
+          externalCheckinUrl: null,
+          platform: 'new-api',
+          proxyUrl: null,
+          useSystemProxy: false,
+          customHeaders: null,
+          status: 'active',
+          isPinned: false,
+          sortOrder: 0,
+          globalWeight: 1,
+          apiKey: null,
+          createdAt: '2026-04-11 08:48:33',
+          updatedAt: '2026-04-11T08:52:36.497Z',
+        },
+        [
+          {
+            id: 1,
+            siteId: 64,
+            url: 'https://api.dd999.uk',
+            enabled: true,
+            sortOrder: 0,
+            cooldownUntil: null,
+            lastSelectedAt: null,
+            lastFailedAt: null,
+            lastFailureReason: null,
+            createdAt: '2026-04-11 08:52:36',
+            updatedAt: '2026-04-11 08:52:36',
+          },
+        ],
+      ),
+    ).toEqual({
+      urls: ['https://api.dd999.uk'],
+      warnings: [],
+    });
+  });
+});
+
 describe('bucket aggregation', () => {
+  test('row drafts use resolved API URL instead of site home URL', () => {
+    const rows = buildRowDraftsForTest(
+      buildBucketsForTest(
+        [
+          makeEntry({
+            resolvedUrl: 'https://api.dd999.uk',
+            site: {
+              id: 64,
+              url: 'https://user.dd999.uk',
+              platform: 'new-api',
+              status: 'active',
+              name: 'https://user.dd999.uk',
+            },
+          }),
+        ],
+        {
+          name: 'test',
+          models: ['gpt-5.4'],
+          entryMode: 'strict-source',
+          modelPackMode: 'split',
+          compatPolicy: 'strict',
+          channelTypes: ['codex'],
+        },
+      ),
+      {
+        name: 'test',
+        models: ['gpt-5.4'],
+        entryMode: 'strict-source',
+        modelPackMode: 'split',
+        compatPolicy: 'strict',
+        channelTypes: ['codex'],
+      },
+    );
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0].url).toBe('https://api.dd999.uk');
+    expect(rows[0].name.startsWith('https://api.dd999.uk|')).toBeTrue();
+  });
+
+  test('auto channel types map gpt models to openai and codex', () => {
+    const rows = rowsFromBuckets(
+      buildBucketsForTest(
+        [
+          makeEntry({
+            requestedModel: 'gpt-5.4',
+            logicalModel: 'gpt-5.4',
+            concreteModel: 'gpt-5.4',
+            rawSourceModel: 'gpt-5.4',
+            canonicalModel: 'gpt-5.4',
+            inferredCanonicalModel: 'gpt-5.4',
+            canonicalModels: new Set(['gpt-5.4']),
+            aliasModels: new Set(['gpt-5.4']),
+          }),
+        ],
+        {
+          name: 'test',
+          models: ['gpt-5.4'],
+          entryMode: 'strict-source',
+          modelPackMode: 'split',
+          compatPolicy: 'strict',
+          channelTypes: ['auto'],
+        },
+      ),
+      {
+        name: 'test',
+        models: ['gpt-5.4'],
+        entryMode: 'strict-source',
+        modelPackMode: 'split',
+        compatPolicy: 'strict',
+        channelTypes: ['auto'],
+      },
+    );
+
+    expect(rows.map((row) => row.channel_type).sort()).toEqual(['codex', 'openai']);
+  });
+
+  test('auto channel types map claude models to anthropic', () => {
+    const rows = rowsFromBuckets(
+      buildBucketsForTest(
+        [
+          makeEntry({
+            requestedModel: 'claude-opus-4.6',
+            logicalModel: 'claude-opus-4.6',
+            concreteModel: 'anthropic:claude-opus-4-6',
+            rawSourceModel: 'anthropic:claude-opus-4-6',
+            canonicalModel: 'claude-opus-4-6',
+            inferredCanonicalModel: 'claude-opus-4-6',
+            canonicalModels: new Set(['claude-opus-4-6']),
+            aliasModels: new Set(['claude-opus-4.6', 'anthropic:claude-opus-4-6']),
+          }),
+        ],
+        {
+          name: 'test',
+          models: ['claude-opus-4.6'],
+          entryMode: 'strict-source',
+          modelPackMode: 'split',
+          compatPolicy: 'strict',
+          channelTypes: ['auto'],
+        },
+      ),
+      {
+        name: 'test',
+        models: ['claude-opus-4.6'],
+        entryMode: 'strict-source',
+        modelPackMode: 'split',
+        compatPolicy: 'strict',
+        channelTypes: ['auto'],
+      },
+    );
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0].channel_type).toBe('anthropic');
+  });
+
+  test('auto channel types fall back to openai for non-gpt non-claude models', () => {
+    const rows = rowsFromBuckets(
+      buildBucketsForTest(
+        [
+          makeEntry({
+            requestedModel: 'glm-5',
+            logicalModel: 'glm-5',
+            concreteModel: 'GLM-5',
+            rawSourceModel: 'GLM-5',
+            canonicalModel: 'glm-5',
+            inferredCanonicalModel: 'glm-5',
+            canonicalModels: new Set(['glm-5']),
+            aliasModels: new Set(['glm-5', 'GLM-5']),
+          }),
+        ],
+        {
+          name: 'test',
+          models: ['glm-5'],
+          entryMode: 'strict-source',
+          modelPackMode: 'split',
+          compatPolicy: 'strict',
+          channelTypes: ['auto'],
+        },
+      ),
+      {
+        name: 'test',
+        models: ['glm-5'],
+        entryMode: 'strict-source',
+        modelPackMode: 'split',
+        compatPolicy: 'strict',
+        channelTypes: ['auto'],
+      },
+    );
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0].channel_type).toBe('openai');
+  });
+
   test('GLM-5 and glm-5 do not merge by default even under shared credential', () => {
     const entries = [
       makeEntry({
@@ -326,6 +524,103 @@ describe('bucket aggregation', () => {
       'gpt-5.3-codex,gpt-5.4',
       'grok-4.1-fast',
     ]);
+  });
+
+  test('shared-credential merge keeps different api keys on the same host as separate rows', () => {
+    const buckets = buildBucketsForTest(
+      [
+        makeEntry({
+          entryKey: 'longcat-9609',
+          resolvedUrl: 'https://api.longcat.chat/openai',
+          site: {
+            id: 67,
+            url: 'https://api.longcat.chat/openai',
+            platform: 'openai',
+            status: 'active',
+            name: 'https://api.longcat.chat',
+          },
+          account: {
+            id: 57,
+            siteId: 67,
+            status: 'active',
+            username: '9609',
+            accessToken: '',
+            apiToken: 'ak-9609',
+          },
+          token: null,
+          apiKey: 'ak-9609',
+          keySource: 'apiToken',
+          requestedModel: 'LongCat-Flash-Lite',
+          logicalModel: 'LongCat-Flash-Lite',
+          concreteModel: 'LongCat-Flash-Lite',
+          rawSourceModel: 'LongCat-Flash-Lite',
+          canonicalModel: 'LongCat-Flash-Lite',
+          inferredCanonicalModel: 'LongCat-Flash-Lite',
+          canonicalModels: new Set(['LongCat-Flash-Lite']),
+          aliasModels: new Set(['LongCat-Flash-Lite']),
+        }),
+        makeEntry({
+          entryKey: 'longcat-4134',
+          resolvedUrl: 'https://api.longcat.chat/openai',
+          site: {
+            id: 67,
+            url: 'https://api.longcat.chat/openai',
+            platform: 'openai',
+            status: 'active',
+            name: 'https://api.longcat.chat',
+          },
+          account: {
+            id: 59,
+            siteId: 67,
+            status: 'active',
+            username: '4134',
+            accessToken: '',
+            apiToken: 'ak-4134',
+          },
+          token: null,
+          apiKey: 'ak-4134',
+          keySource: 'apiToken',
+          requestedModel: 'LongCat-Flash-Lite',
+          logicalModel: 'LongCat-Flash-Lite',
+          concreteModel: 'LongCat-Flash-Lite',
+          rawSourceModel: 'LongCat-Flash-Lite',
+          canonicalModel: 'LongCat-Flash-Lite',
+          inferredCanonicalModel: 'LongCat-Flash-Lite',
+          canonicalModels: new Set(['LongCat-Flash-Lite']),
+          aliasModels: new Set(['LongCat-Flash-Lite']),
+        }),
+      ],
+      {
+        name: 'test',
+        models: ['LongCat-Flash-Lite'],
+        entryMode: 'shared-credential',
+        modelPackMode: 'merge',
+        compatPolicy: 'strict',
+        channelTypes: ['codex'],
+      },
+    );
+
+    const output = buildOutputBucketsForTest(buckets, {
+      name: 'test',
+      models: ['LongCat-Flash-Lite'],
+      entryMode: 'shared-credential',
+      modelPackMode: 'merge',
+      compatPolicy: 'strict',
+      channelTypes: ['codex'],
+    });
+
+    const rows = rowsFromBuckets(output.buckets, {
+      name: 'test',
+      models: ['LongCat-Flash-Lite'],
+      entryMode: 'shared-credential',
+      modelPackMode: 'merge',
+      compatPolicy: 'strict',
+      channelTypes: ['codex'],
+    });
+
+    expect(output.buckets).toHaveLength(2);
+    expect(rows).toHaveLength(2);
+    expect(rows.map((row) => row.api_key).sort()).toEqual(['ak-4134', 'ak-9609']);
   });
 
   test('shared-credential merge still normalizes source-flavored models to logical-group canonical names', () => {

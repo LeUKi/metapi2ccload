@@ -181,6 +181,16 @@ site + account + token-or-fallback-secret + concrete-route + raw-source-model
 
 自动从备份里选出全部 `explicit_group` 的 logical models。
 
+### `--channel-types`
+
+手工指定要导出的 `channel_type`。
+
+如果不指定，默认使用 `auto`：
+
+- `gpt*` → `openai,codex`
+- `claude*` → `anthropic`
+- 其他模型 → `openai`
+
 ### `--entry-mode`
 
 常用值：

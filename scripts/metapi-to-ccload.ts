@@ -17,6 +17,7 @@ interface MetapiBackup {
 
 interface MetapiAccounts {
   sites: Site[];
+  siteApiEndpoints?: SiteApiEndpoint[];
   accounts: Account[];
   accountTokens: AccountToken[];
   tokenRoutes: TokenRoute[];
@@ -41,6 +42,20 @@ interface Site {
   sortOrder: number;
   globalWeight: number;
   apiKey: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface SiteApiEndpoint {
+  id: number;
+  siteId: number;
+  url: string;
+  enabled: boolean;
+  sortOrder: number;
+  cooldownUntil: string | null;
+  lastSelectedAt: string | null;
+  lastFailedAt: string | null;
+  lastFailureReason: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -186,6 +201,7 @@ interface RuntimeConfig {
 
 interface IndexedMetapi {
   siteById: Map<number, Site>;
+  siteApiEndpointsBySiteId: Map<number, SiteApiEndpoint[]>;
   accountById: Map<number, Account>;
   tokenById: Map<number, AccountToken>;
   routeById: Map<number, TokenRoute>;
@@ -211,6 +227,7 @@ interface ResolvedBinding {
 
 interface ResolvedChannelEntry {
   entryKey: string;
+  resolvedUrl: string;
   site: Site;
   account: Account;
   token: AccountToken | null;
@@ -249,6 +266,7 @@ interface MergeGroup {
 
 interface AggregatedBucket {
   bucketKey: string;
+  resolvedUrl: string;
   site: Site;
   account: Account;
   token: AccountToken | null;
@@ -304,7 +322,8 @@ interface PreparedOutput {
 }
 
 const DEFAULT_MODELS = ['gpt-5.4', 'gpt-5.3-codex'];
-const DEFAULT_CHANNEL_TYPES = ['codex', 'openai'];
+const AUTO_CHANNEL_TYPE = 'auto';
+const DEFAULT_CHANNEL_TYPES = [AUTO_CHANNEL_TYPE];
 const DEFAULT_MODEL_MODE: ModelMode = 'merge';
 const DEFAULT_ENTRY_MODE: EntryMode = 'strict-source';
 const DEFAULT_MODEL_PACK_MODE: ModelPackMode = 'merge';
@@ -500,7 +519,7 @@ function printHelpAndExit(): never {
   -o, --output <file>          输出 ccload CSV 路径或基础路径
   -m, --models <list>          单个 profile 的模型列表，使用逗号分隔
       --explicit-groups-only   自动选择备份里全部 explicit_group 的 logical models
-  -t, --channel-types <list>   单个 profile 的 ccload channel_type 列表，使用逗号分隔
+  -t, --channel-types <list>   单个 profile 的 ccload channel_type 列表，使用逗号分隔；支持 auto
       --model-mode <mode>      旧兼容参数：merge | split
       --entry-mode <mode>      strict-source | shared-credential | logical-bundle
       --model-pack-mode <mode> split | merge | canonical-merge
@@ -636,13 +655,14 @@ async function buildRuntimeConfig(params: {
   // 完整指定参数的单 profile CLI 模式仍然保留，方便自动化调用。
   // 如果调用方传入了旧式模型/渠道参数，就把它视为一个
   // 单 profile 导出任务，并跳过交互式 profile 配置流程。
-  if (selectedModels && cliArgs.channelTypes) {
+  if (selectedModels && (cliArgs.channelTypes || cliArgs.models || cliArgs.explicitGroupsOnly)) {
     const normalizedModes = normalizeProfileModes({
       modelMode: cliArgs.modelMode,
       entryMode: cliArgs.entryMode,
       modelPackMode: cliArgs.modelPackMode,
       compatPolicy: cliArgs.compatPolicy,
     });
+    const channelTypes = cliArgs.channelTypes ?? DEFAULT_CHANNEL_TYPES;
 
     const profile: ConversionProfile = {
       name:
@@ -653,14 +673,14 @@ async function buildRuntimeConfig(params: {
           modelMode: cliArgs.modelMode,
           entryMode: normalizedModes.entryMode,
           modelPackMode: normalizedModes.modelPackMode,
-          channelTypes: cliArgs.channelTypes,
+          channelTypes,
         }),
       models: selectedModels,
       modelMode: cliArgs.modelMode,
       entryMode: normalizedModes.entryMode,
       modelPackMode: normalizedModes.modelPackMode,
       compatPolicy: normalizedModes.compatPolicy,
-      channelTypes: cliArgs.channelTypes,
+      channelTypes,
     };
 
     return {
@@ -825,6 +845,18 @@ function buildDefaultProfileName(params: {
   return `${modelPart}-${slugify(modeLabel) || 'mode'}-${typePart}`;
 }
 
+function isAutoChannelTypeProfile(channelTypes: string[]): boolean {
+  return channelTypes.length === 1 && channelTypes[0] === AUTO_CHANNEL_TYPE;
+}
+
+function describeChannelTypes(channelTypes: string[]): string {
+  if (isAutoChannelTypeProfile(channelTypes)) {
+    return 'auto(gpt->openai+codex, claude->anthropic, other->openai)';
+  }
+
+  return channelTypes.join(', ');
+}
+
 function splitCommaSeparated(raw: string, fallback: string[] = []): string[] {
   const values = raw
     .split(',')
@@ -856,9 +888,19 @@ function buildIndexes(accounts: MetapiAccounts): IndexedMetapi {
   // 预先建立这些索引可以让转换逻辑更清晰，主流程不需要反复扫描数组。
   // 导出阶段只需做索引查找，而不是重复遍历 sites/accounts/tokens/routes。
   const siteById = new Map(accounts.sites.map((site) => [site.id, site]));
+  const siteApiEndpointsBySiteId = new Map<number, SiteApiEndpoint[]>();
   const accountById = new Map(accounts.accounts.map((account) => [account.id, account]));
   const tokenById = new Map(accounts.accountTokens.map((token) => [token.id, token]));
   const routeById = new Map(accounts.tokenRoutes.map((route) => [route.id, route]));
+
+  for (const endpoint of accounts.siteApiEndpoints ?? []) {
+    const bucket = siteApiEndpointsBySiteId.get(endpoint.siteId) ?? [];
+    bucket.push(endpoint);
+    siteApiEndpointsBySiteId.set(endpoint.siteId, bucket);
+  }
+  for (const endpoints of siteApiEndpointsBySiteId.values()) {
+    endpoints.sort((left, right) => left.sortOrder - right.sortOrder || left.id - right.id);
+  }
 
   const routeChannelsByRouteId = new Map<number, RouteChannel[]>();
   for (const routeChannel of accounts.routeChannels) {
@@ -876,6 +918,7 @@ function buildIndexes(accounts: MetapiAccounts): IndexedMetapi {
 
   return {
     siteById,
+    siteApiEndpointsBySiteId,
     accountById,
     tokenById,
     routeById,
@@ -951,54 +994,63 @@ function convertProfile(params: {
         const token = routeChannel.tokenId === null ? null : indexed.tokenById.get(routeChannel.tokenId) ?? null;
         const apiKey = chooseApiKey(account, token);
         const rawSourceModel = routeChannel.sourceModel?.trim() || concreteRoute.modelPattern;
-        const entryKey = buildEntryKey({
+        const resolvedUrlResult = resolveExportUrlsForSite(
           site,
-          account,
-          token,
-          concreteRouteId: binding.concreteRouteId,
-          rawSourceModel,
-        });
-        const entry =
-          entryByKey.get(entryKey) ??
-          createEmptyEntry({
-            site,
+          indexed.siteApiEndpointsBySiteId.get(site.id) ?? [],
+        );
+        warnings.push(...resolvedUrlResult.warnings);
+
+        for (const resolvedUrl of resolvedUrlResult.urls) {
+          const entryKey = buildEntryKey({
+            resolvedUrl,
             account,
             token,
-            apiKey,
-            binding,
-            routeChannel,
+            concreteRouteId: binding.concreteRouteId,
+            rawSourceModel,
+          });
+          const entry =
+            entryByKey.get(entryKey) ??
+            createEmptyEntry({
+              resolvedUrl,
+              site,
+              account,
+              token,
+              apiKey,
+              binding,
+              routeChannel,
+              rawSourceModel,
+              canonicalModel,
+            });
+
+          entry.canonicalModels.add(canonicalModel);
+          entry.aliasModels.add(resolution.model);
+          entry.aliasModels.add(binding.logicalModel);
+          entry.aliasModels.add(binding.concreteModel);
+          entry.aliasModels.add(rawSourceModel);
+          for (const bundleId of findBundleIdsForEntry({
+            requestedModel: resolution.model,
+            logicalModel: binding.logicalModel,
+            concreteModel: binding.concreteModel,
             rawSourceModel,
             canonicalModel,
-          });
+          })) {
+            entry.bundleIds.add(bundleId);
+          }
+          entry.priority = Math.min(entry.priority, routeChannel.priority);
+          entry.weight = Math.max(entry.weight, routeChannel.weight);
+          entry.routeChannelEnabled = entry.routeChannelEnabled && routeChannel.enabled;
+          entry.hasSuspiciousPlatform = entry.hasSuspiciousPlatform || SUSPICIOUS_PLATFORMS.has(site.platform);
 
-        entry.canonicalModels.add(canonicalModel);
-        entry.aliasModels.add(resolution.model);
-        entry.aliasModels.add(binding.logicalModel);
-        entry.aliasModels.add(binding.concreteModel);
-        entry.aliasModels.add(rawSourceModel);
-        for (const bundleId of findBundleIdsForEntry({
-          requestedModel: resolution.model,
-          logicalModel: binding.logicalModel,
-          concreteModel: binding.concreteModel,
-          rawSourceModel,
-          canonicalModel,
-        })) {
-          entry.bundleIds.add(bundleId);
+          if (concreteRoute.modelMapping) {
+            entry.modelMappings.push(concreteRoute.modelMapping);
+          }
+
+          const inferredCanonicalModel = inferCanonicalModelFromEntry(entry);
+          entry.inferredCanonicalModel = inferredCanonicalModel;
+          entry.canonicalModels.add(inferredCanonicalModel);
+
+          entryByKey.set(entryKey, entry);
         }
-        entry.priority = Math.min(entry.priority, routeChannel.priority);
-        entry.weight = Math.max(entry.weight, routeChannel.weight);
-        entry.routeChannelEnabled = entry.routeChannelEnabled && routeChannel.enabled;
-        entry.hasSuspiciousPlatform = entry.hasSuspiciousPlatform || SUSPICIOUS_PLATFORMS.has(site.platform);
-
-        if (concreteRoute.modelMapping) {
-          entry.modelMappings.push(concreteRoute.modelMapping);
-        }
-
-        const inferredCanonicalModel = inferCanonicalModelFromEntry(entry);
-        entry.inferredCanonicalModel = inferredCanonicalModel;
-        entry.canonicalModels.add(inferredCanonicalModel);
-
-        entryByKey.set(entryKey, entry);
       }
     }
   }
@@ -1219,18 +1271,53 @@ function chooseApiKey(
 }
 
 function buildEntryKey(params: {
-  site: Site;
+  resolvedUrl: string;
   account: Account;
   token: AccountToken | null;
   concreteRouteId: number;
   rawSourceModel: string;
 }): string {
-  const { site, account, token, concreteRouteId, rawSourceModel } = params;
+  const { resolvedUrl, account, token, concreteRouteId, rawSourceModel } = params;
   const tokenPart = token ? `token:${token.id}` : 'token:fallback-account-secret';
-  return `${site.url} | account:${account.id} | ${tokenPart} | route:${concreteRouteId} | source:${rawSourceModel}`;
+  return `${resolvedUrl} | account:${account.id} | ${tokenPart} | route:${concreteRouteId} | source:${rawSourceModel}`;
+}
+
+function resolveExportUrlsForSite(
+  site: Site,
+  siteApiEndpoints: SiteApiEndpoint[],
+): { urls: string[]; warnings: string[] } {
+  const warnings: string[] = [];
+  if (siteApiEndpoints.length === 0) {
+    return { urls: [site.url], warnings };
+  }
+
+  const enabledUrls = Array.from(
+    new Set(
+      siteApiEndpoints
+        .filter((endpoint) => endpoint.enabled)
+        .map((endpoint) => endpoint.url.trim())
+        .filter(Boolean),
+    ),
+  );
+
+  if (enabledUrls.length === 0) {
+    warnings.push(
+      `site ${site.id} (${site.url}) 存在 siteApiEndpoints，但没有启用中的 endpoint；已回退使用 site.url。`,
+    );
+    return { urls: [site.url], warnings };
+  }
+
+  if (enabledUrls.length > 1) {
+    warnings.push(
+      `site ${site.id} (${site.url}) 有多个启用中的 siteApiEndpoints；已按 API endpoint 拆分导出。`,
+    );
+  }
+
+  return { urls: enabledUrls, warnings };
 }
 
 function createEmptyEntry(params: {
+  resolvedUrl: string;
   site: Site;
   account: Account;
   token: AccountToken | null;
@@ -1242,12 +1329,13 @@ function createEmptyEntry(params: {
 }): ResolvedChannelEntry {
   return {
     entryKey: buildEntryKey({
-      site: params.site,
+      resolvedUrl: params.resolvedUrl,
       account: params.account,
       token: params.token,
       concreteRouteId: params.binding.concreteRouteId,
       rawSourceModel: params.rawSourceModel,
     }),
+    resolvedUrl: params.resolvedUrl,
     site: params.site,
     account: params.account,
     token: params.token,
@@ -1288,7 +1376,7 @@ function createEmptyEntry(params: {
 
 function compareEntries(left: ResolvedChannelEntry, right: ResolvedChannelEntry): number {
   return (
-    left.site.url.localeCompare(right.site.url) ||
+    left.resolvedUrl.localeCompare(right.resolvedUrl) ||
     left.account.id - right.account.id ||
     (left.token?.id ?? -1) - (right.token?.id ?? -1) ||
     left.concreteRouteId - right.concreteRouteId ||
@@ -1437,7 +1525,7 @@ function partitionBucketsByMergeCluster(
 
 function buildSharedCredentialMergeKey(bucket: AggregatedBucket): string {
   const tokenPart = bucket.token ? `token:${bucket.token.id}` : 'token:fallback-account-secret';
-  return [bucket.site.url, bucket.account.id, tokenPart, bucket.apiKey, bucket.keySource].join('|');
+  return [bucket.resolvedUrl, bucket.account.id, tokenPart, bucket.apiKey, bucket.keySource].join('|');
 }
 
 function buildLogicalMergeKey(bucket: AggregatedBucket): string {
@@ -1450,6 +1538,7 @@ function createMergedSharedCredentialBucket(groupBuckets: AggregatedBucket[]): A
   const first = sortedBuckets[0];
   const merged: AggregatedBucket = {
     bucketKey: `${first.bucketKey}|shared-merged`,
+    resolvedUrl: first.resolvedUrl,
     site: first.site,
     account: first.account,
     token: first.token,
@@ -1529,6 +1618,7 @@ function createBucketFromEntry(params: {
 
   return {
     bucketKey: params.bucketKey,
+    resolvedUrl: params.entry.resolvedUrl,
     site: params.entry.site,
     account: params.entry.account,
     token: params.entry.token,
@@ -1657,6 +1747,43 @@ function inferCanonicalFromModelMappings(
   return undefined;
 }
 
+function resolveChannelTypesForBucket(
+  bucket: AggregatedBucket,
+  profile: ConversionProfile,
+  modelLabel: string,
+): string[] {
+  if (!isAutoChannelTypeProfile(profile.channelTypes)) {
+    return profile.channelTypes;
+  }
+
+  const candidates = new Set<string>([
+    modelLabel,
+    bucket.primaryCanonicalModel,
+    ...bucket.requestedModels,
+    ...bucket.logicalModels,
+    ...bucket.canonicalModels,
+    ...bucket.aliasModels,
+  ]);
+  const loweredCandidates = Array.from(candidates)
+    .map((candidate) => candidate.trim().toLowerCase())
+    .filter(Boolean);
+
+  if (loweredCandidates.some((candidate) => candidate.startsWith('gpt'))) {
+    return ['openai', 'codex'];
+  }
+
+  if (
+    loweredCandidates.some(
+      (candidate) =>
+        candidate.startsWith('claude') || candidate.includes(':claude') || candidate.includes('/claude'),
+    )
+  ) {
+    return ['anthropic'];
+  }
+
+  return ['openai'];
+}
+
 function buildRowDrafts(params: {
   buckets: AggregatedBucket[];
   profile: ConversionProfile;
@@ -1669,7 +1796,7 @@ function buildRowDrafts(params: {
   if (profile.modelPackMode === 'split') {
     for (const bucket of buckets) {
       const modelLabel = Array.from(bucket.canonicalModels).sort().join(',');
-      for (const channelType of profile.channelTypes) {
+      for (const channelType of resolveChannelTypesForBucket(bucket, profile, modelLabel)) {
         rows.push({
           name: buildChannelName({
             entry: bucket,
@@ -1679,7 +1806,7 @@ function buildRowDrafts(params: {
             appendProfileNameToName,
           }),
           api_key: bucket.apiKey,
-          url: bucket.site.url,
+          url: bucket.resolvedUrl,
           priority: String(bucket.priority),
           models: modelLabel,
           model_redirects: JSON.stringify(buildBucketRedirects(bucket, profile.modelPackMode)),
@@ -1702,7 +1829,7 @@ function buildRowDrafts(params: {
       profile.modelPackMode === 'canonical-merge'
         ? resolvedCanonicalModel
         : Array.from(bucket.canonicalModels).sort().join(',');
-    for (const channelType of profile.channelTypes) {
+    for (const channelType of resolveChannelTypesForBucket(bucket, profile, modelLabel)) {
       rows.push({
         name: buildChannelName({
           entry: bucket,
@@ -1712,7 +1839,7 @@ function buildRowDrafts(params: {
           appendProfileNameToName,
         }),
         api_key: bucket.apiKey,
-        url: bucket.site.url,
+        url: bucket.resolvedUrl,
         priority: String(bucket.priority),
         models: modelLabel,
         model_redirects: JSON.stringify(
@@ -1863,7 +1990,7 @@ function buildChannelName(params: {
   // 可选尾段：
   //   |profile-name
   const parts = [
-    entry.site.url,
+    entry.resolvedUrl,
     buildDisplayLabel(entry),
     `acct-${entry.account.id}`,
     'account-secret',
@@ -1900,6 +2027,7 @@ function buildDisplayLabel(entry: { token: AccountToken | null; account: Account
 
 interface MergedChannelEntry {
   mergeKey: string;
+  resolvedUrl: string;
   site: Site;
   account: Account;
   token: AccountToken | null;
@@ -2112,7 +2240,7 @@ function printConversionSummary(params: {
     console.log(`- entry-mode：${profileResult.profile.entryMode}`);
     console.log(`- model-pack-mode：${profileResult.profile.modelPackMode}`);
     console.log(`- compat-policy：${profileResult.profile.compatPolicy}`);
-    console.log(`- 渠道类型：${profileResult.profile.channelTypes.join(', ')}`);
+    console.log(`- 渠道类型：${describeChannelTypes(profileResult.profile.channelTypes)}`);
     console.log(`- source entry 数量：${profileResult.entries.length}`);
     console.log(`- bucket 数量：${profileResult.buckets.length}`);
     console.log(`- 启用中的 source entry 数量：${enabledEntryCount}`);
@@ -2297,6 +2425,7 @@ function buildOutputBucketsForTest(
 
 export { buildBucketsForTest, buildRowDraftsForTest, normalizeProfileModesForTest, buildOutputBucketsForTest };
 export { collectExplicitGroupLogicalModels as collectExplicitGroupLogicalModelsForTest };
+export { resolveExportUrlsForSite as resolveExportUrlsForSiteForTest };
 
 if (import.meta.main) {
   main().catch((error: unknown) => {
